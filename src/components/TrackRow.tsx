@@ -11,6 +11,7 @@ import {
 } from '../lib/spatial';
 import type { ListenerState, SpatialSettings } from '../types';
 import type { WorkbenchApi } from '../state/useWorkbench';
+import { AutomationPanel } from './AutomationPanel';
 
 interface Props {
   track: Track;
@@ -25,8 +26,11 @@ function fmt(t: number | null): string {
 }
 
 export function TrackRow({ track, api }: Props) {
-  const { doc, playingIds } = api;
+  const { doc, playingIds, displayTracks } = api;
   const playing = playingIds.has(track.id);
+  const override = api.overrideIds.has(track.id);
+  // 播放中显示轨：位置/增益为自动化在播放头处的采样值（2D/3D/读数同一数据源）
+  const view = displayTracks.find((x) => x.id === track.id) ?? track;
   const [progress, setProgress] = useState(0);
   const listener: ListenerState = doc.listener;
   const spatial: SpatialSettings = doc.spatial;
@@ -46,9 +50,10 @@ export function TrackRow({ track, api }: Props) {
     return () => cancelAnimationFrame(raf);
   }, [playing, track.id]);
 
-  const az = relativeAzimuth(track.position, listener);
-  const dist = distanceTo(track.position, listener.position);
-  const elev = elevationAngle(track.position, listener.position);
+  // 方位读数基于“当前时刻”位置：自动化播放时与 2D/3D/实际声像同步
+  const az = relativeAzimuth(view.position, listener);
+  const dist = distanceTo(view.position, listener.position);
+  const elev = elevationAngle(view.position, listener.position);
   const dGain = distanceGain(
     dist,
     spatial.distanceModel,
@@ -87,6 +92,28 @@ export function TrackRow({ track, api }: Props) {
       {track.status === 'decode-error' && (
         <div className="track-error" title={track.errorMessage}>
           ⚠ {track.errorMessage ?? '解码失败'}
+        </div>
+      )}
+
+      {override && (
+        <div className="override-banner">
+          <span>✋ 临时覆盖中：计划自动化已暂停，未改动关键帧</span>
+          <span className="override-actions">
+            <button
+              className="btn mini"
+              onClick={() => api.cancelOverride(track.id)}
+              title="取消拖拽改动，回到当前播放头的计划位置"
+            >
+              取消（回轨迹）
+            </button>
+            <button
+              className="btn mini primary"
+              onClick={() => api.commitOverride(track.id)}
+              title="在当前播放头提交为新关键帧（同刻冲突会被拒绝）"
+            >
+              提交为关键帧
+            </button>
+          </span>
         </div>
       )}
 
@@ -133,10 +160,15 @@ export function TrackRow({ track, api }: Props) {
           min={0}
           max={1.5}
           step={0.01}
-          value={track.gain}
+          value={view.gain}
           onChange={(e) => api.updateTrack(track.id, { gain: Number(e.target.value) })}
         />
-        <span className="gain-readout">{gainToDb(track.muted ? 0 : track.gain)}</span>
+        <span className="gain-readout">{gainToDb(track.muted ? 0 : view.gain)}</span>
+        {track.automation.keyframes.length > 0 && (
+          <span className="auto-badge" title="该轨存在增益/空间自动化">
+            AUTO
+          </span>
+        )}
       </div>
 
       <div
@@ -178,6 +210,14 @@ export function TrackRow({ track, api }: Props) {
           ))}
         </div>
       ) : null}
+
+      <AutomationPanel
+        track={track}
+        playhead={progress}
+        currentPosition={view.position}
+        currentGain={view.gain}
+        api={api}
+      />
     </div>
   );
 }

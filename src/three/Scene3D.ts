@@ -1,10 +1,10 @@
 import * as THREE from 'three';
-import type { ListenerState, Track, Vec3 } from '../types';
+import type { DisplayTrack, ListenerState, Vec3 } from '../types';
 import { forwardVector } from '../lib/spatial';
 
 interface SceneHandle {
   destroy: () => void;
-  sync: (tracks: Track[], listener: ListenerState, selectedId: string | null) => void;
+  sync: (tracks: DisplayTrack[], listener: ListenerState, selectedId: string | null) => void;
 }
 
 interface DragState {
@@ -132,6 +132,8 @@ export function createScene(
     sphere: THREE.Mesh;
     ring: THREE.Mesh;
     label: THREE.Sprite;
+    /** 朝向指示（关键帧含 orientation 时显示），向量与 PannerNode 一致 */
+    orientArrow: THREE.ArrowHelper;
     trackId: string;
   }
   const sourceVisuals = new Map<string, SourceVisual>();
@@ -158,7 +160,7 @@ export function createScene(
     return sprite;
   }
 
-  function createSourceVisual(track: Track): SourceVisual {
+  function createSourceVisual(track: DisplayTrack): SourceVisual {
     const group = new THREE.Group();
     const color = new THREE.Color(track.color);
     const sphere = new THREE.Mesh(
@@ -182,6 +184,18 @@ export function createScene(
     ring.visible = false;
     group.add(ring);
 
+    // 朝向箭头：默认隐藏；自动化关键帧给出方向时按同一世界向量显示
+    const orientArrow = new THREE.ArrowHelper(
+      new THREE.Vector3(1, 0, 0),
+      new THREE.Vector3(0, 0.3, 0),
+      0.7,
+      track.color,
+      0.18,
+      0.11,
+    );
+    orientArrow.visible = false;
+    group.add(orientArrow);
+
     const label = makeTextSprite(track.name, track.color);
     label.position.y = 0.95;
     group.add(label);
@@ -189,7 +203,7 @@ export function createScene(
     group.position.set(track.position.x, track.position.y, track.position.z);
     group.userData.trackId = track.id;
     scene.add(group);
-    return { group, sphere, ring, label, trackId: track.id };
+    return { group, sphere, ring, label, orientArrow, trackId: track.id };
   }
 
   function disposeVisual(v: SourceVisual) {
@@ -327,7 +341,7 @@ export function createScene(
   // ---------- 状态同步 ----------
   let lastListener: ListenerState | null = null;
 
-  function sync(tracks: Track[], listener: ListenerState, selectedId: string | null) {
+  function sync(tracks: DisplayTrack[], listener: ListenerState, selectedId: string | null) {
     // 增删
     const seen = new Set(tracks.map((t) => t.id));
     for (const [id, v] of [...sourceVisuals.entries()]) {
@@ -350,6 +364,23 @@ export function createScene(
       (v.sphere.material as THREE.MeshStandardMaterial).emissive.set(
         muted ? 0x000000 : col.clone().multiplyScalar(0.35),
       );
+      // 朝向指示：与 PannerNode.orientation 使用完全相同的世界向量
+      const o = track.effectiveOrientation;
+      if (o) {
+        const len = Math.hypot(o.x, o.y, o.z);
+        if (len > 1e-6) {
+          v.orientArrow.visible = true;
+          v.orientArrow.position.set(0, 0.3, 0);
+          v.orientArrow.setDirection(new THREE.Vector3(o.x / len, o.y / len, o.z / len));
+          (v.orientArrow.line.material as THREE.LineBasicMaterial).color.set(
+            muted ? 0x555a63 : track.color,
+          );
+        } else {
+          v.orientArrow.visible = false;
+        }
+      } else {
+        v.orientArrow.visible = false;
+      }
     }
 
     if (!lastListener || listener !== lastListener) {

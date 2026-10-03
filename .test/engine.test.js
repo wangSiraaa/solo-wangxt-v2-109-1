@@ -114,12 +114,89 @@ var init_samples = __esm({
   }
 });
 
+// src/lib/automation.ts
+function lerp(a, b, u) {
+  return a + (b - a) * u;
+}
+function lerpVec3(a, b, u) {
+  return { x: lerp(a.x, b.x, u), y: lerp(a.y, b.y, u), z: lerp(a.z, b.z, u) };
+}
+function sampleLane(lane, t) {
+  const kfs = lane.keyframes;
+  const out = {};
+  if (kfs.length === 0) return out;
+  for (const name of ALL_PARAMS) {
+    let first = -1;
+    let last = -1;
+    for (let i = 0; i < kfs.length; i++) {
+      if (getParam(kfs[i].params, name) !== void 0) {
+        if (first < 0) first = i;
+        last = i;
+      }
+    }
+    if (first < 0) continue;
+    if (t < kfs[first].time) continue;
+    if (t >= kfs[last].time) {
+      assignParam(out, name, getParam(kfs[last].params, name));
+      continue;
+    }
+    let li = -1;
+    let ri = -1;
+    for (let i = 0; i < kfs.length; i++) {
+      if (getParam(kfs[i].params, name) === void 0) continue;
+      if (kfs[i].time <= t) li = i;
+      if (kfs[i].time >= t && ri < 0) ri = i;
+    }
+    const lv = getParam(kfs[li].params, name);
+    const rv = ri >= 0 ? getParam(kfs[ri].params, name) : void 0;
+    if (rv === void 0 || ri === li) {
+      assignParam(out, name, lv);
+    } else {
+      const span = kfs[ri].time - kfs[li].time;
+      const u = span > 0 ? (t - kfs[li].time) / span : 0;
+      if (name === "gain") {
+        out.gain = lerp(lv, rv, u);
+      } else {
+        assignParam(out, name, lerpVec3(lv, rv, u));
+      }
+    }
+  }
+  return out;
+}
+function sampleLaneLoop(lane, t, cycle) {
+  if (!Number.isFinite(cycle) || cycle <= 0) return sampleLane(lane, t);
+  const m = (t % cycle + cycle) % cycle;
+  return sampleLane(lane, m);
+}
+function getParam(p, name) {
+  return p[name];
+}
+function assignParam(out, name, v) {
+  if (v === void 0) return;
+  if (name === "gain") out.gain = v;
+  else if (name === "position") out.position = { ...v };
+  else out.orientation = { ...v };
+}
+function laneHasParam(lane, name) {
+  return lane.keyframes.some((k) => getParam(k.params, name) !== void 0);
+}
+var ALL_PARAMS;
+var init_automation = __esm({
+  "src/lib/automation.ts"() {
+    "use strict";
+    ALL_PARAMS = ["position", "orientation", "gain"];
+  }
+});
+
 // src/lib/audioEngine.ts
 var audioEngine_exports = {};
 __export(audioEngine_exports, {
   AudioEngine: () => AudioEngine,
   DecodeError: () => DecodeError
 });
+function laneOf(track) {
+  return track.automation ?? { schema: 1, keyframes: [], revision: 0, updatedAt: 0 };
+}
 function localUp(yaw, pitch) {
   const cp = Math.cos(pitch);
   const sp = Math.sin(pitch);
@@ -129,12 +206,13 @@ function localUp(yaw, pitch) {
     z: sp * Math.cos(yaw)
   };
 }
-var DecodeError, AudioEngine;
+var DecodeError, AUTO_INTERVAL_MS, AUTO_LOOKAHEAD_SEC, SCHED_EPS, AudioEngine;
 var init_audioEngine = __esm({
   "src/lib/audioEngine.ts"() {
     "use strict";
     init_spatial();
     init_samples();
+    init_automation();
     DecodeError = class extends Error {
       trackId;
       constructor(trackId, message) {
@@ -143,6 +221,9 @@ var init_audioEngine = __esm({
         this.trackId = trackId;
       }
     };
+    AUTO_INTERVAL_MS = 25;
+    AUTO_LOOKAHEAD_SEC = 0.3;
+    SCHED_EPS = 1e-6;
     AudioEngine = class {
       ctx = null;
       unlock = "locked";
@@ -154,6 +235,7 @@ var init_audioEngine = __esm({
       timeDomainBuf = new Float32Array(new ArrayBuffer(8192));
       peakWorklet = null;
       workletFailed = false;
+      autoTimer = null;
       voices = /* @__PURE__ */ new Map();
       buffers = /* @__PURE__ */ new Map();
       pendingFiles = /* @__PURE__ */ new Map();
@@ -209,6 +291,7 @@ var init_audioEngine = __esm({
           this.unlock = "unlocked";
           this.emitUnlock();
           this.startMeterLoop();
+          this.startAutomationClock();
           void this.ensurePeakWorklet(ctx);
         } catch (err) {
           this.unlock = "failed";
@@ -419,7 +502,6 @@ registerProcessor('peak-meter', PeakMeterProcessor);
       createVoice(track, buffer) {
         const ctx = this.ctx;
         const source = ctx.createBufferSource();
-        source.buffer = buffer;
         source.loop = track.loop;
         const trackGain = ctx.createGain();
         trackGain.gain.value = track.muted ? 0 : track.gain;
@@ -455,7 +537,8 @@ registerProcessor('peak-meter', PeakMeterProcessor);
           consumed: false,
           startedAt: 0,
           offset: 0,
-          duration: buffer.duration
+          duration: buffer.duration,
+          auto: null
         };
         source.onended = () => {
           if (!voice.playing) return;
@@ -463,6 +546,7 @@ registerProcessor('peak-meter', PeakMeterProcessor);
           voice.playing = false;
           voice.consumed = true;
           voice.offset = 0;
+          voice.auto = null;
           const fresh = this.createVoice(latest, buffer);
           fresh.offset = 0;
           this.voices.set(track.id, fresh);
@@ -480,17 +564,23 @@ registerProcessor('peak-meter', PeakMeterProcessor);
         const ctx = this.ctx;
         const t = ctx.currentTime;
         const tau = Math.max(5e-3, this.spatial?.positionTimeConstant ?? 0.05);
-        voice.panner.positionX.setTargetAtTime(track.position.x, t, tau);
-        voice.panner.positionY.setTargetAtTime(track.position.y, t, tau);
-        voice.panner.positionZ.setTargetAtTime(track.position.z, t, tau);
+        const autoOwns = !!(voice.auto && !voice.auto.override);
+        if (!autoOwns) {
+          voice.panner.positionX.setTargetAtTime(track.position.x, t, tau);
+          voice.panner.positionY.setTargetAtTime(track.position.y, t, tau);
+          voice.panner.positionZ.setTargetAtTime(track.position.z, t, tau);
+          voice.trackGain.gain.setTargetAtTime(track.muted ? 0 : track.gain, t, 0.01);
+        }
         voice.panner.distanceModel = this.spatial?.distanceModel ?? voice.panner.distanceModel;
-        voice.trackGain.gain.setTargetAtTime(track.muted ? 0 : track.gain, t, 0.01);
         if (voice.source.loop !== track.loop) voice.source.loop = track.loop;
         const audible = this.shouldBeAudible(track);
         if (audible !== voice.audiblyRouted) {
           voice.panner.disconnect();
           voice.panner.connect(audible ? this.soloBus : this.muteBus);
           voice.audiblyRouted = audible;
+        }
+        if (voice.auto && !voice.auto.override && voice.playing && (voice.spec.loop !== track.loop || voice.spec.muted !== track.muted)) {
+          this.armAutomation(voice, laneOf(track), this.currentOffset(voice));
         }
         voice.spec = track;
       }
@@ -507,7 +597,9 @@ registerProcessor('peak-meter', PeakMeterProcessor);
             v.panner.connect(audible ? this.soloBus : this.muteBus);
             v.audiblyRouted = audible;
           }
-          v.trackGain.gain.setTargetAtTime(tr.muted ? 0 : tr.gain, this.ctx.currentTime, 0.01);
+          if (!(v.auto && !v.auto.override)) {
+            v.trackGain.gain.setTargetAtTime(tr.muted ? 0 : tr.gain, this.ctx.currentTime, 0.01);
+          }
           v.spec = tr;
         }
       }
@@ -515,13 +607,19 @@ registerProcessor('peak-meter', PeakMeterProcessor);
        * 高频实时同步：对已存在的 voice 更新位置/增益/loop/独奏路由。
        * 不创建节点、不触碰 source，移动声源不会重启音轨。
        * 尚未创建 voice 的声轨（未解锁/未解码）跳过，由 ensureTrack 负责。
+       * 自动化轨 revision 变化（编辑/提交关键帧）时，在当前播放头重新 arm。
        */
       syncTracks(tracks) {
         if (!this.ctx) return;
         this.anySolo = tracks.some((t) => t.solo);
         for (const tr of tracks) {
           const v = this.voices.get(tr.id);
-          if (v) this.updateVoiceLive(v, tr);
+          if (v) {
+            if (v.playing && v.auto && v.auto.lane.revision !== laneOf(tr).revision) {
+              this.armAutomation(v, laneOf(tr), this.currentOffset(v));
+            }
+            this.updateVoiceLive(v, tr);
+          }
         }
       }
       getChannelCount(trackId) {
@@ -530,6 +628,7 @@ registerProcessor('peak-meter', PeakMeterProcessor);
       /**
        * 重建声轨输入图（切换立体声文件的 L/R 声道时使用）。
        * 保持播放偏移；若原本在播放，从同一位置继续（声道选择本身不属于“移动”）。
+       * 自动化在重建后重新 arm（不重启 source 语义：此处仅声道切换的既有路径）。
        */
       async rebuildVoiceGraph(track) {
         await this.ensureTrack(track);
@@ -537,6 +636,7 @@ registerProcessor('peak-meter', PeakMeterProcessor);
         const buf = this.buffers.get(track.id);
         if (!old || !buf) return;
         const wasPlaying = old.playing;
+        const hadAuto = !!(old.auto && !old.auto.override);
         const offset = wasPlaying ? this.currentOffset(old) : old.offset;
         const nv = this.replaceVoice(old, track, buf, offset);
         if (wasPlaying) {
@@ -544,6 +644,202 @@ registerProcessor('peak-meter', PeakMeterProcessor);
           nv.startedAt = this.ctx.currentTime;
           nv.playing = true;
           nv.consumed = true;
+          const rebuiltLane = laneOf(track);
+          if (hadAuto && rebuiltLane.keyframes.length > 0) {
+            this.armAutomation(nv, rebuiltLane, offset);
+          }
+        }
+      }
+      // ---------- 空间自动化调度 ----------
+      /**
+       * 在 voice 上锚定自动化：取消该轨旧的未触发事件，以当前播放头采样值为起点，
+       * 随后由 automationClock 前瞻下发。绝不触碰 source（不 start/stop、不叠加发声）。
+       */
+      armAutomation(voice, lane, offset) {
+        const ctx = this.ctx;
+        const now = ctx.currentTime;
+        const loop = voice.source.loop;
+        const dur = voice.duration;
+        const startOffset = loop ? (offset % dur + dur) % dur : Math.min(Math.max(0, offset), dur);
+        const p = sampleLaneLoop(lane, startOffset, dur);
+        const params = [
+          [voice.panner.positionX, p.position?.x, "position"],
+          [voice.panner.positionY, p.position?.y, "position"],
+          [voice.panner.positionZ, p.position?.z, "position"],
+          [voice.panner.orientationX, p.orientation?.x, "orientation"],
+          [voice.panner.orientationY, p.orientation?.y, "orientation"],
+          [voice.panner.orientationZ, p.orientation?.z, "orientation"],
+          [voice.trackGain.gain, p.gain, "gain"]
+        ];
+        for (const [ap, value] of params) {
+          if (value === void 0) continue;
+          ap.cancelScheduledValues(now);
+          ap.setValueAtTime(value, now);
+        }
+        voice.auto = {
+          lane,
+          startCtx: now,
+          startOffset,
+          override: false,
+          loop,
+          position: { untilVirtual: startOffset },
+          orientation: { untilVirtual: startOffset },
+          gain: { untilVirtual: startOffset }
+        };
+      }
+      disarmAutomation(voice) {
+        if (!voice.auto || !this.ctx) {
+          voice.auto = null;
+          return;
+        }
+        const now = this.ctx.currentTime;
+        voice.panner.positionX.cancelScheduledValues(now);
+        voice.panner.positionY.cancelScheduledValues(now);
+        voice.panner.positionZ.cancelScheduledValues(now);
+        voice.panner.orientationX?.cancelScheduledValues(now);
+        voice.panner.orientationY?.cancelScheduledValues(now);
+        voice.panner.orientationZ?.cancelScheduledValues(now);
+        voice.trackGain.gain.cancelScheduledValues(now);
+        voice.auto = null;
+      }
+      /**
+       * 播放中开始人工临时覆盖：取消尚未发生的自动化事件，实时写入即刻接管。
+       * 不修改任何关键帧数据；调用方可随后取消（回到计划轨迹）或提交（新增关键帧）。
+       */
+      beginOverride(trackId) {
+        const v = this.voices.get(trackId);
+        if (!v || !v.playing || !v.auto || v.auto.override) return false;
+        v.auto.override = true;
+        const ctx = this.ctx;
+        const now = ctx.currentTime;
+        for (const ap of [
+          v.panner.positionX,
+          v.panner.positionY,
+          v.panner.positionZ,
+          v.panner.orientationX,
+          v.panner.orientationY,
+          v.panner.orientationZ,
+          v.trackGain.gain
+        ]) {
+          ap?.cancelScheduledValues(now);
+        }
+        this.updateVoiceLive(v, v.spec);
+        return true;
+      }
+      /** 取消临时覆盖：在当前播放头重新锚定计划轨迹（关键帧数据未被篡改） */
+      cancelOverride(trackId) {
+        const v = this.voices.get(trackId);
+        if (!v || !v.playing || !v.auto || !v.auto.override) return false;
+        const lane = v.auto.lane;
+        this.armAutomation(v, lane, this.currentOffset(v));
+        return true;
+      }
+      isOverride(trackId) {
+        return this.voices.get(trackId)?.auto?.override ?? false;
+      }
+      isAutomationArmed(trackId) {
+        const a = this.voices.get(trackId)?.auto;
+        return !!a && !a.override;
+      }
+      /**
+       * 自动化前瞻时钟：以 AudioContext 时间为准，把窗口内的关键帧事件
+       * （阶梯 setValueAtTime / 段内 linearRampToValueAtTime）下发给各 AudioParam。
+       * 每个锚点只下发一次（untilVirtual 游标），暂停/seek/循环重 arm 后旧事件
+       * 已被 cancelScheduledValues 取消，绝不叠加或重复发声。
+       */
+      startAutomationClock() {
+        if (this.autoTimer != null) return;
+        this.autoTimer = setInterval(() => {
+          if (!this.ctx) return;
+          for (const v of this.voices.values()) {
+            if (!v.playing || !v.auto || v.auto.override) continue;
+            try {
+              this.pumpAutomation(v);
+            } catch {
+            }
+          }
+        }, AUTO_INTERVAL_MS);
+      }
+      /** 单次前瞻下发；抽出为方法便于测试直接驱动 */
+      pumpAutomation(voice) {
+        const auto = voice.auto;
+        const ctx = this.ctx;
+        if (!auto || !ctx || auto.override) return;
+        const now = ctx.currentTime;
+        const until = now + AUTO_LOOKAHEAD_SEC;
+        const lane = auto.lane;
+        const dur = voice.duration;
+        const endCtx = auto.loop ? Infinity : auto.startCtx + (dur - auto.startOffset);
+        const horizonCtx = Math.min(until, endCtx);
+        if (laneHasParam(lane, "position")) {
+          this.scheduleParam(voice, "position", lane, auto, horizonCtx);
+        }
+        if (laneHasParam(lane, "orientation")) {
+          this.scheduleParam(voice, "orientation", lane, auto, horizonCtx);
+        }
+        if (laneHasParam(lane, "gain")) {
+          if (!voice.spec.muted) this.scheduleParam(voice, "gain", lane, auto, horizonCtx);
+        }
+      }
+      scheduleParam(voice, name, lane, auto, horizonCtx) {
+        const dur = voice.duration;
+        const state = auto[name];
+        const keys = lane.keyframes.filter((k) => k.params[name] !== void 0);
+        if (keys.length === 0) return;
+        let guard = 0;
+        for (; ; ) {
+          if (guard++ > 2e3) break;
+          const base = state.untilVirtual;
+          let nextKeyV = Infinity;
+          for (let i = 0; i < keys.length; i++) {
+            const kt = keys[i].time;
+            let cand;
+            if (auto.loop) {
+              const n = Math.floor((base - kt) / dur) + 1;
+              cand = kt + Math.max(0, n) * dur;
+              if (cand <= base + SCHED_EPS) cand += dur;
+            } else {
+              cand = kt;
+              if (cand <= base + SCHED_EPS) continue;
+            }
+            if (cand < nextKeyV) nextKeyV = cand;
+          }
+          let nextBndV = Infinity;
+          if (auto.loop) {
+            const n = Math.floor((base - auto.startOffset) / dur) + 1;
+            nextBndV = auto.startOffset + n * dur;
+            if (nextBndV <= base + SCHED_EPS) nextBndV += dur;
+          }
+          const anchorV = Math.min(nextKeyV, nextBndV);
+          if (!Number.isFinite(anchorV)) break;
+          const anchorCtx = auto.startCtx + (anchorV - auto.startOffset);
+          if (anchorCtx > horizonCtx + SCHED_EPS) break;
+          const isBoundary = nextBndV <= nextKeyV;
+          const local = auto.loop ? (anchorV % dur + dur) % dur : anchorV;
+          const sampled = sampleLane(lane, isBoundary ? 0 : local);
+          const value = name === "gain" ? sampled.gain : sampled[name];
+          if (value === void 0) {
+            state.untilVirtual = anchorV;
+            continue;
+          }
+          if (name === "gain") {
+            const ap = voice.trackGain.gain;
+            if (isBoundary) ap.setValueAtTime(value, anchorCtx);
+            else ap.linearRampToValueAtTime(value, anchorCtx);
+          } else {
+            const v3 = value;
+            const axes = name === "position" ? [voice.panner.positionX, voice.panner.positionY, voice.panner.positionZ] : [
+              voice.panner.orientationX,
+              voice.panner.orientationY,
+              voice.panner.orientationZ
+            ];
+            const comps = [v3.x, v3.y, v3.z];
+            for (let ax = 0; ax < 3; ax++) {
+              if (isBoundary) axes[ax].setValueAtTime(comps[ax], anchorCtx);
+              else axes[ax].linearRampToValueAtTime(comps[ax], anchorCtx);
+            }
+          }
+          state.untilVirtual = anchorV;
         }
       }
       // ---------- 传输控制 ----------
@@ -561,6 +857,10 @@ registerProcessor('peak-meter', PeakMeterProcessor);
         voice.startedAt = ctx.currentTime;
         voice.playing = true;
         voice.consumed = true;
+        const playLane = laneOf(track);
+        if (playLane.keyframes.length > 0) {
+          this.armAutomation(voice, playLane, voice.offset);
+        }
       }
       pauseTrack(track) {
         const voice = this.voices.get(track.id);
@@ -590,13 +890,18 @@ registerProcessor('peak-meter', PeakMeterProcessor);
           nv.startedAt = this.ctx.currentTime;
           nv.playing = true;
           nv.consumed = true;
+          const seekLane = laneOf(track);
+          if (seekLane.keyframes.length > 0) {
+            this.armAutomation(nv, seekLane, offset);
+          }
         }
       }
       /**
        * 停止旧节点并按最新参数重建（仅用于暂停/停止/跳转）。
-       * 位置移动严禁走此路径。
+       * 位置移动严禁走此路径。自动化运行时随之消失（旧 AudioParam 事件一并取消）。
        */
       replaceVoice(old, track, buffer, offset) {
+        this.disarmAutomation(old);
         try {
           old.source.onended = null;
           old.source.stop();
@@ -618,6 +923,7 @@ registerProcessor('peak-meter', PeakMeterProcessor);
       removeTrack(trackId) {
         const voice = this.voices.get(trackId);
         if (voice) {
+          this.disarmAutomation(voice);
           try {
             voice.source.onended = null;
             voice.source.stop();
@@ -644,6 +950,10 @@ registerProcessor('peak-meter', PeakMeterProcessor);
       }
       dispose() {
         cancelAnimationFrame(this.rafHandle);
+        if (this.autoTimer != null) {
+          clearInterval(this.autoTimer);
+          this.autoTimer = null;
+        }
         for (const id of [...this.voices.keys()]) this.removeTrack(id);
         void this.ctx?.close();
         this.ctx = null;
@@ -659,6 +969,8 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 var FakeAudioParam = class {
   value;
   events = [];
+  ramps = [];
+  canceled = [];
   constructor(v) {
     this.value = v;
   }
@@ -666,8 +978,18 @@ var FakeAudioParam = class {
     this.value = v;
     this.events.push({ time, value: v, tc });
   }
-  setValueAtTime(v) {
+  setValueAtTime(v, time) {
     this.value = v;
+    this.events.push({ time, value: v, tc: -1 });
+  }
+  linearRampToValueAtTime(v, time) {
+    this.value = v;
+    this.ramps.push({ time, value: v });
+  }
+  cancelScheduledValues(time) {
+    this.canceled.push({ time });
+    this.events = this.events.filter((e) => e.time < time);
+    this.ramps = this.ramps.filter((r) => r.time <= time);
   }
 };
 var FakeNode = class {
@@ -703,6 +1025,8 @@ var FakePanner = class extends FakeNode {
   positionZ = new FakeAudioParam(0);
   positionTimeConstant = 0;
   orientationX = new FakeAudioParam(1);
+  orientationY = new FakeAudioParam(0);
+  orientationZ = new FakeAudioParam(0);
   constructor(_ctx, opts = {}) {
     super();
     Object.assign(this, opts);
@@ -833,6 +1157,7 @@ function baseTrack(over = {}) {
     color: "#fff",
     position: { x: 2, y: 0, z: 0 },
     status: "pending",
+    automation: { schema: 1, keyframes: [], revision: 0, updatedAt: 0 },
     ...over
   };
 }
@@ -964,5 +1289,148 @@ describe("AudioEngine \u56FE\u884C\u4E3A\uFF08\u6A21\u62DF\u73AF\u5883\uFF09", (
     const buf = createSampleBuffer2(engine.ctx, "pulse");
     assert.equal(buf.numberOfChannels, 1);
     assert.ok(Math.abs(buf.duration - 1.6) < 1e-6);
+  });
+  function lane(trackId, keyframes) {
+    const lane2 = {
+      schema: 1,
+      revision: 1,
+      updatedAt: 0,
+      keyframes: keyframes.map((k, i) => ({
+        id: `kf-${trackId}-${i}`,
+        time: k.time,
+        params: {
+          position: { x: k.pos[0], y: k.pos[1], z: k.pos[2] },
+          ...k.gain !== void 0 ? { gain: k.gain } : {}
+        }
+      }))
+    };
+    return lane2;
+  }
+  function getVoice(trackId) {
+    return engine.voices.get(trackId);
+  }
+  function pump() {
+    engine.pumpAutomation(getVoice("a1"));
+  }
+  it("\u64AD\u653E\u7ECF\u8FC7\u591A\u4E2A\u5173\u952E\u5E27\uFF1A\u8C03\u5EA6\u5668\u6309\u65F6\u949F\u4E0B\u53D1\u4F4D\u7F6E/\u589E\u76CA\u4E8B\u4EF6\uFF0Csource start/stop \u4E0D\u589E\u52A0", async () => {
+    await engine.resume();
+    const ctx = engine.ctx;
+    const t = {
+      ...baseTrack({ id: "a1", loop: false }),
+      automation: lane("a1", [
+        { time: 0, pos: [-5, 0, 0] },
+        { time: 0.2, pos: [5, 0, 0] },
+        { time: 0.4, pos: [0, 3, 0], gain: 0.3 }
+      ])
+    };
+    await engine.playTrack(t);
+    const v = getVoice("a1");
+    const starts = v.source.started.length;
+    const stops = v.source.stopped;
+    assert.ok(Math.abs(v.panner.positionX.value - -5) < 1e-9);
+    ctx.currentTime = 0;
+    pump();
+    const rampsAt02 = v.panner.positionX.ramps.filter((r) => Math.abs(r.time - 0.2) < 1e-9);
+    assert.equal(rampsAt02.length, 1, "0.2s \u4F4D\u7F6E\u7EBF\u6027\u63D2\u503C\u5E94\u88AB\u8C03\u5EA6");
+    assert.ok(Math.abs(rampsAt02[0].value - 5) < 1e-9);
+    assert.equal(
+      v.panner.positionX.ramps.some((r) => Math.abs(r.time - 0.4) < 1e-9),
+      false,
+      "\u8D85\u51FA\u524D\u77BB\u7A97\u53E3\u7684\u5173\u952E\u5E27\u4E0D\u5F97\u63D0\u524D\u8C03\u5EA6"
+    );
+    ctx.currentTime = 0.15;
+    pump();
+    assert.equal(v.panner.positionX.ramps.filter((r) => Math.abs(r.time - 0.4) < 1e-9).length, 1);
+    assert.equal(v.trackGain.gain.ramps.filter((r) => Math.abs(r.time - 0.4) < 1e-9 && Math.abs(r.value - 0.3) < 1e-9).length, 1);
+    ctx.currentTime = 0.16;
+    pump();
+    assert.equal(v.panner.positionX.ramps.filter((r) => Math.abs(r.time - 0.2) < 1e-9).length, 1);
+    assert.equal(v.panner.positionX.ramps.filter((r) => Math.abs(r.time - 0.4) < 1e-9).length, 1);
+    assert.equal(v.source.started.length, starts);
+    assert.equal(v.source.stopped, stops);
+  });
+  it("\u4E34\u65F6\u8986\u76D6\u53D6\u6D88\u540E\u7EED\u81EA\u52A8\u5316\u4E8B\u4EF6\uFF1B\u53D6\u6D88\u8986\u76D6\u5728\u64AD\u653E\u5934\u91CD\u65B0\u951A\u5B9A\uFF1Bsource \u4E0D\u91CD\u542F", async () => {
+    await engine.resume();
+    const ctx = engine.ctx;
+    const t = {
+      ...baseTrack({ id: "a1", loop: false }),
+      automation: lane("a1", [
+        { time: 0, pos: [-5, 0, 0] },
+        { time: 0.2, pos: [5, 0, 0] }
+      ])
+    };
+    await engine.playTrack(t);
+    const v = getVoice("a1");
+    const starts = v.source.started.length;
+    ctx.currentTime = 0.1;
+    pump();
+    assert.equal(engine.beginOverride("a1"), true);
+    assert.ok(v.panner.positionX.canceled.length >= 1);
+    assert.equal(v.auto.override, true);
+    const rampCount = v.panner.positionX.ramps.length;
+    ctx.currentTime = 0.15;
+    pump();
+    assert.equal(v.panner.positionX.ramps.length, rampCount);
+    assert.equal(engine.cancelOverride("a1"), true);
+    assert.ok(Math.abs(v.panner.positionX.value - 2.5) < 1e-9);
+    assert.equal(v.source.started.length, starts, "\u8986\u76D6\u53D6\u6D88\u4E0D\u5F97\u91CD\u542F source");
+  });
+  it("\u6682\u505C\u540E seek \u518D\u64AD\u653E\uFF1A\u65E7\u8C03\u5EA6\u88AB\u53D6\u6D88\u4E14\u4E0D\u91CD\u590D\u53D1\u58F0\uFF08start \u6B21\u6570\u4E0D\u53E0\u52A0\uFF09", async () => {
+    await engine.resume();
+    const ctx = engine.ctx;
+    const t = {
+      ...baseTrack({ id: "a1", loop: false }),
+      automation: lane("a1", [
+        { time: 0, pos: [-5, 0, 0] },
+        { time: 0.2, pos: [5, 0, 0] }
+      ])
+    };
+    await engine.playTrack(t);
+    ctx.currentTime = 0.1;
+    pump();
+    const totalStarts = () => engine.voices.get("a1").source.started.length;
+    engine.pauseTrack(t);
+    const vAfterPause = getVoice("a1");
+    assert.equal(vAfterPause.playing, false);
+    assert.equal(vAfterPause.auto, null);
+    ctx.currentTime = 0.2;
+    await engine.seekTrack(t, 0.05, true);
+    const v2 = getVoice("a1");
+    assert.equal(v2.playing, true);
+    assert.ok(v2.auto !== null);
+    assert.ok(Math.abs(v2.panner.positionX.value - -2.5) < 1e-9);
+    pump();
+    assert.equal(
+      v2.panner.positionX.ramps.some((r) => Math.abs(r.time - 0.35) < 1e-9),
+      true
+    );
+  });
+  it("\u5FAA\u73AF\uFF1A\u5173\u952E\u5E27\u968F\u5468\u671F\u91CD\u590D\u8C03\u5EA6\uFF0C\u8DE8\u5468\u671F\u5728\u8FB9\u754C\u9636\u68AF\u91CD\u7F6E\uFF0C\u4E0D\u53E0\u52A0\u65E7\u8C03\u5EA6", async () => {
+    await engine.resume();
+    const ctx = engine.ctx;
+    const t = {
+      ...baseTrack({ id: "a1", sourceType: "file", loop: true }),
+      automation: lane("a1", [
+        { time: 0, pos: [-5, 0, 0] },
+        { time: 0.2, pos: [5, 0, 0] }
+      ])
+    };
+    engine.setFileBlob("a1", new Blob([new TextEncoder().encode("OK")], { type: "audio/x" }));
+    await engine.playTrack(t);
+    const v = getVoice("a1");
+    assert.equal(v.duration, 1);
+    ctx.currentTime = 0;
+    pump();
+    ctx.currentTime = 0.9;
+    pump();
+    const stepAt1 = v.panner.positionX.events.some(
+      (e) => Math.abs(e.time - 1) < 1e-9 && Math.abs(e.value - -5) < 1e-9
+    );
+    assert.ok(stepAt1, "\u5FAA\u73AF\u8FB9\u754C\u5E94\u9636\u68AF\u8DF3\u56DE\u8D77\u70B9\u503C");
+    const rampAt12 = v.panner.positionX.ramps.some(
+      (r) => Math.abs(r.time - 1.2) < 1e-9 && Math.abs(r.value - 5) < 1e-9
+    );
+    assert.ok(rampAt12, "\u7B2C\u4E8C\u5468\u671F\u7684\u5173\u952E\u5E27\u5E94\u91CD\u590D\u8C03\u5EA6");
+    assert.equal(v.source.stopped, 0);
   });
 });

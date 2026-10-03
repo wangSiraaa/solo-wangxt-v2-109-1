@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { ListenerState, Track, Vec3 } from '../types';
+import type { DisplayTrack, ListenerState, Vec3 } from '../types';
 import { rightVector, forwardVector } from '../lib/spatial';
 
 interface Props {
-  tracks: Track[];
+  tracks: DisplayTrack[];
   listener: ListenerState;
   selectedId: string | null;
   onSelect: (id: string | null) => void;
@@ -135,6 +135,9 @@ export function Plan2D({
         {/* 声源 */}
         {tracks.map((t) => {
           const selected = t.id === selectedId;
+          // 自动化关键帧含朝向时，画出 XZ 平面朝向刻度（与 PannerNode 同一向量）
+          const o = t.effectiveOrientation;
+          const ol = o ? Math.hypot(o.x, o.z) : 0;
           return (
             <g
               key={t.id}
@@ -147,6 +150,18 @@ export function Plan2D({
             >
               {selected && (
                 <circle cx={toX(t.position.x)} cy={toY(t.position.z)} r={14} fill="none" stroke="#fff" strokeWidth={1.5} />
+              )}
+              {o && ol > 1e-6 && (
+                <line
+                  x1={toX(t.position.x)}
+                  y1={toY(t.position.z)}
+                  x2={toX(t.position.x + (o.x / ol) * 0.7)}
+                  y2={toY(t.position.z + (o.z / ol) * 0.7)}
+                  stroke={t.muted ? '#555a63' : t.color}
+                  strokeWidth={2}
+                  strokeDasharray="3 3"
+                  opacity={0.85}
+                />
               )}
               <circle
                 cx={toX(t.position.x)}

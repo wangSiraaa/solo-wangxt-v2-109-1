@@ -81,11 +81,16 @@ export default function App() {
 
         <main className="stage">
           <div className={`view-container ${view === '3d' ? 'show' : ''}`}>
-            <Scene3DView api={api} onMoveSource={onMoveSource} onMoveListener={onMoveListener} />
+            <Scene3DView
+              api={api}
+              tracks={api.displayTracks}
+              onMoveSource={onMoveSource}
+              onMoveListener={onMoveListener}
+            />
           </div>
           <div className={`view-container ${view === '2d' ? 'show' : ''}`}>
             <Plan2D
-              tracks={api.doc.tracks}
+              tracks={api.displayTracks}
               listener={api.doc.listener}
               selectedId={api.selectedId}
               onSelect={api.selectTrack}
@@ -107,6 +112,14 @@ export default function App() {
         <div className="global-toast">
           ⚠ {api.globalError}
           <button className="btn mini" onClick={api.dismissGlobalError}>
+            知道了
+          </button>
+        </div>
+      )}
+      {api.automationError && (
+        <div className="global-toast automation-toast">
+          ⚠ 自动化提交被拒绝：{api.automationError}
+          <button className="btn mini" onClick={api.dismissAutomationError}>
             知道了
           </button>
         </div>

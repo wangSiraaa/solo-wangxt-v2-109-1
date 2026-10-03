@@ -13,20 +13,51 @@
  * 关键约定：
  *  - 移动声源只更新 PannerNode 的 position AudioParam（setTargetAtTime 平滑），
  *    绝不 stop/start 源节点，因此移动不会重启音轨。
+ *  - 空间自动化同样只写 AudioParam：由 AudioContext 时钟 + 前瞻 lookahead 调度器
+ *    下发 setValueAtTime / linearRampToValueAtTime 事件；arm/disarm 只取消
+ *    旧事件并重新锚定，绝不创建或重启 BufferSource，也不会叠加旧调度。
+ *  - 播放中的人工拖拽是“临时覆盖”（取消尚未发生的自动化事件）；取消覆盖后
+ *    在当前播放头重新锚定自动化；提交覆盖属于数据层动作（新增关键帧）。
  *  - 静音 = trackGain.gain=0；独奏通过 soloBus/muteBus 真实切换路由。
  *  - 峰值/削波在实际输出链末端（destination 之前）由 AudioWorklet 逐采样检测；
  *    Worklet 不可用时回退到 AnalyserNode 时域峰值（同样在输出链上）。
  *  - AudioContext 必须由用户手势解锁；解码失败逐条声轨以 DecodeError 上报。
  */
 import type {
+  AutomationLane,
   LevelState,
   ListenerState,
   SpatialSettings,
   Track,
   UnlockState,
+  Vec3,
 } from '../types';
 import { forwardVector } from './spatial';
 import { createSampleBuffer } from './samples';
+import { laneHasParam, sampleLane, sampleLaneLoop } from './automation';
+
+/** 防御性读取自动化轨（历史缓存/测试夹具可能缺省该字段） */
+function laneOf(track: Track): AutomationLane {
+  return track.automation ?? { schema: 1 as const, keyframes: [], revision: 0, updatedAt: 0 };
+}
+
+interface ParamAutomationState {
+  /** 已调度到的虚拟媒体时间（秒，未取模）；其后的事件尚未下发 */
+  untilVirtual: number;
+}
+
+interface VoiceAutomation {
+  lane: AutomationLane;
+  /** 开始（arm）时的 AudioContext 时间与媒体偏移：ctx = startCtx + (virtual - startOffset) */
+  startCtx: number;
+  startOffset: number;
+  /** true = 人工临时覆盖：调度器停止下发，updateVoiceLive 重新接管实时参数 */
+  override: boolean;
+  loop: boolean;
+  position: ParamAutomationState;
+  orientation: ParamAutomationState;
+  gain: ParamAutomationState;
+}
 
 interface TrackVoice {
   trackId: string;
@@ -41,6 +72,8 @@ interface TrackVoice {
   startedAt: number;
   offset: number;
   duration: number;
+  /** 播放中存在的自动化运行时（arm 时创建，disarm/重建即消失） */
+  auto: VoiceAutomation | null;
 }
 
 export type EngineUnlockListener = (state: UnlockState) => void;
@@ -56,6 +89,12 @@ export class DecodeError extends Error {
   }
 }
 
+/** 自动化调度节拍：25ms 唤醒，0.3s 前瞻（页面卡顿/后台节流也有余量） */
+const AUTO_INTERVAL_MS = 25;
+const AUTO_LOOKAHEAD_SEC = 0.3;
+/** 浮点比较容差，避免同一事件重复下发 */
+const SCHED_EPS = 1e-6;
+
 export class AudioEngine {
   ctx: AudioContext | null = null;
   unlock: UnlockState = 'locked';
@@ -68,6 +107,7 @@ export class AudioEngine {
   private timeDomainBuf: Float32Array<ArrayBuffer> = new Float32Array(new ArrayBuffer(8192));
   private peakWorklet: AudioWorkletNode | null = null;
   private workletFailed = false;
+  private autoTimer: ReturnType<typeof setInterval> | null = null;
 
   private voices = new Map<string, TrackVoice>();
   private buffers = new Map<string, AudioBuffer>();
@@ -131,6 +171,7 @@ export class AudioEngine {
       this.unlock = 'unlocked';
       this.emitUnlock();
       this.startMeterLoop();
+      this.startAutomationClock();
       void this.ensurePeakWorklet(ctx);
     } catch (err) {
       this.unlock = 'failed';
@@ -363,7 +404,6 @@ registerProcessor('peak-meter', PeakMeterProcessor);
   private createVoice(track: Track, buffer: AudioBuffer): TrackVoice {
     const ctx = this.ctx!;
     const source = ctx.createBufferSource();
-    source.buffer = buffer;
     source.loop = track.loop;
 
     const trackGain = ctx.createGain();
@@ -407,6 +447,7 @@ registerProcessor('peak-meter', PeakMeterProcessor);
       startedAt: 0,
       offset: 0,
       duration: buffer.duration,
+      auto: null,
     };
 
     source.onended = () => {
@@ -415,6 +456,7 @@ registerProcessor('peak-meter', PeakMeterProcessor);
       voice.playing = false;
       voice.consumed = true;
       voice.offset = 0;
+      voice.auto = null;
       // 以最新参数立即重建待播 voice，保证自然结束后再次按播放不会对已结束 source start
       const fresh = this.createVoice(latest, buffer);
       fresh.offset = 0;
@@ -436,12 +478,18 @@ registerProcessor('peak-meter', PeakMeterProcessor);
     const t = ctx.currentTime;
     const tau = Math.max(0.005, this.spatial?.positionTimeConstant ?? 0.05);
 
-    voice.panner.positionX.setTargetAtTime(track.position.x, t, tau);
-    voice.panner.positionY.setTargetAtTime(track.position.y, t, tau);
-    voice.panner.positionZ.setTargetAtTime(track.position.z, t, tau);
+    // 自动化在播放中拥有 position/orientation/gain AudioParam；
+    // 只有非播放、或处于人工临时覆盖时，实时拖拽/推子才直接写入。
+    const autoOwns = !!(voice.auto && !voice.auto.override);
+
+    if (!autoOwns) {
+      voice.panner.positionX.setTargetAtTime(track.position.x, t, tau);
+      voice.panner.positionY.setTargetAtTime(track.position.y, t, tau);
+      voice.panner.positionZ.setTargetAtTime(track.position.z, t, tau);
+      voice.trackGain.gain.setTargetAtTime(track.muted ? 0 : track.gain, t, 0.01);
+    }
     voice.panner.distanceModel = this.spatial?.distanceModel ?? voice.panner.distanceModel;
 
-    voice.trackGain.gain.setTargetAtTime(track.muted ? 0 : track.gain, t, 0.01);
     if (voice.source.loop !== track.loop) voice.source.loop = track.loop;
 
     const audible = this.shouldBeAudible(track);
@@ -450,6 +498,18 @@ registerProcessor('peak-meter', PeakMeterProcessor);
       voice.panner.connect(audible ? this.soloBus! : this.muteBus!);
       voice.audiblyRouted = audible;
     }
+
+    // 播放中切换 loop/静音会改变自动化循环周期或增益锚点：在当前播放头重新 arm，
+    // 旧调度被取消（不叠加），source 不重启。
+    if (
+      voice.auto &&
+      !voice.auto.override &&
+      voice.playing &&
+      (voice.spec.loop !== track.loop || voice.spec.muted !== track.muted)
+    ) {
+      this.armAutomation(voice, laneOf(track), this.currentOffset(voice));
+    }
+
     voice.spec = track;
   }
 
@@ -466,7 +526,9 @@ registerProcessor('peak-meter', PeakMeterProcessor);
         v.panner.connect(audible ? this.soloBus! : this.muteBus!);
         v.audiblyRouted = audible;
       }
-      v.trackGain.gain.setTargetAtTime(tr.muted ? 0 : tr.gain, this.ctx.currentTime, 0.01);
+      if (!(v.auto && !v.auto.override)) {
+        v.trackGain.gain.setTargetAtTime(tr.muted ? 0 : tr.gain, this.ctx.currentTime, 0.01);
+      }
       v.spec = tr;
     }
   }
@@ -475,13 +537,21 @@ registerProcessor('peak-meter', PeakMeterProcessor);
    * 高频实时同步：对已存在的 voice 更新位置/增益/loop/独奏路由。
    * 不创建节点、不触碰 source，移动声源不会重启音轨。
    * 尚未创建 voice 的声轨（未解锁/未解码）跳过，由 ensureTrack 负责。
+   * 自动化轨 revision 变化（编辑/提交关键帧）时，在当前播放头重新 arm。
    */
   syncTracks(tracks: Track[]) {
     if (!this.ctx) return;
     this.anySolo = tracks.some((t) => t.solo);
     for (const tr of tracks) {
       const v = this.voices.get(tr.id);
-      if (v) this.updateVoiceLive(v, tr);
+      if (v) {
+        // 自动化轨 revision 变化（编辑/撤销/提交关键帧）时在当前播放头重新 arm。
+        // 提交临时覆盖也走此路径：arm 会把 override 标志复位，原覆盖结束。
+        if (v.playing && v.auto && v.auto.lane.revision !== laneOf(tr).revision) {
+          this.armAutomation(v, laneOf(tr), this.currentOffset(v));
+        }
+        this.updateVoiceLive(v, tr);
+      }
     }
   }
 
@@ -492,6 +562,7 @@ registerProcessor('peak-meter', PeakMeterProcessor);
   /**
    * 重建声轨输入图（切换立体声文件的 L/R 声道时使用）。
    * 保持播放偏移；若原本在播放，从同一位置继续（声道选择本身不属于“移动”）。
+   * 自动化在重建后重新 arm（不重启 source 语义：此处仅声道切换的既有路径）。
    */
   async rebuildVoiceGraph(track: Track): Promise<void> {
     await this.ensureTrack(track);
@@ -499,6 +570,7 @@ registerProcessor('peak-meter', PeakMeterProcessor);
     const buf = this.buffers.get(track.id);
     if (!old || !buf) return;
     const wasPlaying = old.playing;
+    const hadAuto = !!(old.auto && !old.auto.override);
     const offset = wasPlaying ? this.currentOffset(old) : old.offset;
     const nv = this.replaceVoice(old, track, buf, offset);
     if (wasPlaying) {
@@ -506,6 +578,235 @@ registerProcessor('peak-meter', PeakMeterProcessor);
       nv.startedAt = this.ctx!.currentTime;
       nv.playing = true;
       nv.consumed = true;
+      const rebuiltLane = laneOf(track);
+      if (hadAuto && rebuiltLane.keyframes.length > 0) {
+        this.armAutomation(nv, rebuiltLane, offset);
+      }
+    }
+  }
+
+  // ---------- 空间自动化调度 ----------
+
+  /**
+   * 在 voice 上锚定自动化：取消该轨旧的未触发事件，以当前播放头采样值为起点，
+   * 随后由 automationClock 前瞻下发。绝不触碰 source（不 start/stop、不叠加发声）。
+   */
+  private armAutomation(voice: TrackVoice, lane: AutomationLane, offset: number) {
+    const ctx = this.ctx!;
+    const now = ctx.currentTime;
+    const loop = voice.source.loop;
+    const dur = voice.duration;
+    const startOffset = loop ? ((offset % dur) + dur) % dur : Math.min(Math.max(0, offset), dur);
+
+    const p = sampleLaneLoop(lane, startOffset, dur);
+    const params: [AudioParam, number | undefined, keyof VoiceAutomation][] = [
+      [voice.panner.positionX, p.position?.x, 'position'],
+      [voice.panner.positionY, p.position?.y, 'position'],
+      [voice.panner.positionZ, p.position?.z, 'position'],
+      [voice.panner.orientationX, p.orientation?.x, 'orientation'],
+      [voice.panner.orientationY, p.orientation?.y, 'orientation'],
+      [voice.panner.orientationZ, p.orientation?.z, 'orientation'],
+      [voice.trackGain.gain, p.gain, 'gain'],
+    ];
+    for (const [ap, value] of params) {
+      if (value === undefined) continue;
+      ap.cancelScheduledValues(now);
+      ap.setValueAtTime(value, now);
+    }
+
+    voice.auto = {
+      lane,
+      startCtx: now,
+      startOffset,
+      override: false,
+      loop,
+      position: { untilVirtual: startOffset },
+      orientation: { untilVirtual: startOffset },
+      gain: { untilVirtual: startOffset },
+    };
+  }
+
+  private disarmAutomation(voice: TrackVoice) {
+    if (!voice.auto || !this.ctx) {
+      voice.auto = null;
+      return;
+    }
+    const now = this.ctx.currentTime;
+    voice.panner.positionX.cancelScheduledValues(now);
+    voice.panner.positionY.cancelScheduledValues(now);
+    voice.panner.positionZ.cancelScheduledValues(now);
+    voice.panner.orientationX?.cancelScheduledValues(now);
+    voice.panner.orientationY?.cancelScheduledValues(now);
+    voice.panner.orientationZ?.cancelScheduledValues(now);
+    voice.trackGain.gain.cancelScheduledValues(now);
+    voice.auto = null;
+  }
+
+  /**
+   * 播放中开始人工临时覆盖：取消尚未发生的自动化事件，实时写入即刻接管。
+   * 不修改任何关键帧数据；调用方可随后取消（回到计划轨迹）或提交（新增关键帧）。
+   */
+  beginOverride(trackId: string): boolean {
+    const v = this.voices.get(trackId);
+    if (!v || !v.playing || !v.auto || v.auto.override) return false;
+    v.auto.override = true;
+    const ctx = this.ctx!;
+    const now = ctx.currentTime;
+    for (const ap of [
+      v.panner.positionX,
+      v.panner.positionY,
+      v.panner.positionZ,
+      v.panner.orientationX,
+      v.panner.orientationY,
+      v.panner.orientationZ,
+      v.trackGain.gain,
+    ]) {
+      ap?.cancelScheduledValues(now);
+    }
+    // 立刻以当前 spec（拖拽产生的新 doc）接管，避免残留一帧计划值
+    this.updateVoiceLive(v, v.spec);
+    return true;
+  }
+
+  /** 取消临时覆盖：在当前播放头重新锚定计划轨迹（关键帧数据未被篡改） */
+  cancelOverride(trackId: string): boolean {
+    const v = this.voices.get(trackId);
+    if (!v || !v.playing || !v.auto || !v.auto.override) return false;
+    const lane = v.auto.lane;
+    this.armAutomation(v, lane, this.currentOffset(v));
+    return true;
+  }
+
+  isOverride(trackId: string): boolean {
+    return this.voices.get(trackId)?.auto?.override ?? false;
+  }
+
+  isAutomationArmed(trackId: string): boolean {
+    const a = this.voices.get(trackId)?.auto;
+    return !!a && !a.override;
+  }
+
+  /**
+   * 自动化前瞻时钟：以 AudioContext 时间为准，把窗口内的关键帧事件
+   * （阶梯 setValueAtTime / 段内 linearRampToValueAtTime）下发给各 AudioParam。
+   * 每个锚点只下发一次（untilVirtual 游标），暂停/seek/循环重 arm 后旧事件
+   * 已被 cancelScheduledValues 取消，绝不叠加或重复发声。
+   */
+  private startAutomationClock() {
+    if (this.autoTimer != null) return;
+    this.autoTimer = setInterval(() => {
+      if (!this.ctx) return;
+      for (const v of this.voices.values()) {
+        if (!v.playing || !v.auto || v.auto.override) continue;
+        try {
+          this.pumpAutomation(v);
+        } catch {
+          /* 单轨调度异常不影响其他轨与输出链 */
+        }
+      }
+    }, AUTO_INTERVAL_MS);
+  }
+
+  /** 单次前瞻下发；抽出为方法便于测试直接驱动 */
+  pumpAutomation(voice: TrackVoice): void {
+    const auto = voice.auto;
+    const ctx = this.ctx;
+    if (!auto || !ctx || auto.override) return;
+    const now = ctx.currentTime;
+    const until = now + AUTO_LOOKAHEAD_SEC;
+    const lane = auto.lane;
+    const dur = voice.duration;
+    const endCtx = auto.loop ? Infinity : auto.startCtx + (dur - auto.startOffset);
+    const horizonCtx = Math.min(until, endCtx);
+
+    if (laneHasParam(lane, 'position')) {
+      this.scheduleParam(voice, 'position', lane, auto, horizonCtx);
+    }
+    if (laneHasParam(lane, 'orientation')) {
+      this.scheduleParam(voice, 'orientation', lane, auto, horizonCtx);
+    }
+    if (laneHasParam(lane, 'gain')) {
+      // 静音时增益链路由实时 0 接管，跳过自动化增益事件（解除静音会重新 arm）
+      if (!voice.spec.muted) this.scheduleParam(voice, 'gain', lane, auto, horizonCtx);
+    }
+  }
+
+  private scheduleParam(
+    voice: TrackVoice,
+    name: 'position' | 'orientation' | 'gain',
+    lane: AutomationLane,
+    auto: VoiceAutomation,
+    horizonCtx: number,
+  ) {
+    const dur = voice.duration;
+    const state = auto[name];
+    const keys = lane.keyframes.filter((k) => k.params[name] !== undefined);
+    if (keys.length === 0) return;
+
+    let guard = 0;
+    for (;;) {
+      if (guard++ > 2000) break;
+      const base = state.untilVirtual;
+
+      // 下一个含该参数的关键帧（循环时按周期重复）
+      let nextKeyV = Infinity;
+      for (let i = 0; i < keys.length; i++) {
+        const kt = keys[i].time;
+        let cand: number;
+        if (auto.loop) {
+          const n = Math.floor((base - kt) / dur) + 1;
+          cand = kt + Math.max(0, n) * dur;
+          if (cand <= base + SCHED_EPS) cand += dur;
+        } else {
+          cand = kt;
+          if (cand <= base + SCHED_EPS) continue;
+        }
+        if (cand < nextKeyV) nextKeyV = cand;
+      }
+
+      // 下一个循环边界（局部时间 0）：值阶梯跳回周期起点采样值
+      let nextBndV = Infinity;
+      if (auto.loop) {
+        const n = Math.floor((base - auto.startOffset) / dur) + 1;
+        nextBndV = auto.startOffset + n * dur;
+        if (nextBndV <= base + SCHED_EPS) nextBndV += dur;
+      }
+
+      const anchorV = Math.min(nextKeyV, nextBndV);
+      if (!Number.isFinite(anchorV)) break;
+      const anchorCtx = auto.startCtx + (anchorV - auto.startOffset);
+      if (anchorCtx > horizonCtx + SCHED_EPS) break;
+
+      const isBoundary = nextBndV <= nextKeyV;
+      const local = auto.loop ? ((anchorV % dur) + dur) % dur : anchorV;
+      const sampled = sampleLane(lane, isBoundary ? 0 : local);
+      const value = (name === 'gain' ? sampled.gain : sampled[name]) as number | Vec3 | undefined;
+      if (value === undefined) {
+        state.untilVirtual = anchorV;
+        continue;
+      }
+
+      if (name === 'gain') {
+        const ap = voice.trackGain.gain;
+        if (isBoundary) ap.setValueAtTime(value as number, anchorCtx);
+        else ap.linearRampToValueAtTime(value as number, anchorCtx);
+      } else {
+        const v3 = value as Vec3;
+        const axes =
+          name === 'position'
+            ? [voice.panner.positionX, voice.panner.positionY, voice.panner.positionZ]
+            : [
+                voice.panner.orientationX,
+                voice.panner.orientationY,
+                voice.panner.orientationZ,
+              ];
+        const comps = [v3.x, v3.y, v3.z];
+        for (let ax = 0; ax < 3; ax++) {
+          if (isBoundary) axes[ax].setValueAtTime(comps[ax], anchorCtx);
+          else axes[ax].linearRampToValueAtTime(comps[ax], anchorCtx);
+        }
+      }
+      state.untilVirtual = anchorV;
     }
   }
 
@@ -526,12 +827,17 @@ registerProcessor('peak-meter', PeakMeterProcessor);
     voice.startedAt = ctx.currentTime;
     voice.playing = true;
     voice.consumed = true;
+    const playLane = laneOf(track);
+    if (playLane.keyframes.length > 0) {
+      this.armAutomation(voice, playLane, voice.offset);
+    }
   }
 
   pauseTrack(track: Track) {
     const voice = this.voices.get(track.id);
     if (!voice || !voice.playing) return;
     voice.offset = this.currentOffset(voice);
+    // replaceVoice 内部 disarm：旧事件随旧节点取消，不会叠加
     this.replaceVoice(voice, track, this.buffers.get(track.id)!, voice.offset);
   }
 
@@ -560,12 +866,16 @@ registerProcessor('peak-meter', PeakMeterProcessor);
       nv.startedAt = this.ctx!.currentTime;
       nv.playing = true;
       nv.consumed = true;
+      const seekLane = laneOf(track);
+      if (seekLane.keyframes.length > 0) {
+        this.armAutomation(nv, seekLane, offset);
+      }
     }
   }
 
   /**
    * 停止旧节点并按最新参数重建（仅用于暂停/停止/跳转）。
-   * 位置移动严禁走此路径。
+   * 位置移动严禁走此路径。自动化运行时随之消失（旧 AudioParam 事件一并取消）。
    */
   private replaceVoice(
     old: TrackVoice,
@@ -573,6 +883,7 @@ registerProcessor('peak-meter', PeakMeterProcessor);
     buffer: AudioBuffer,
     offset: number,
   ): TrackVoice {
+    this.disarmAutomation(old);
     try {
       old.source.onended = null;
       old.source.stop();
@@ -597,6 +908,7 @@ registerProcessor('peak-meter', PeakMeterProcessor);
   removeTrack(trackId: string) {
     const voice = this.voices.get(trackId);
     if (voice) {
+      this.disarmAutomation(voice);
       try {
         voice.source.onended = null;
         voice.source.stop();
@@ -628,6 +940,10 @@ registerProcessor('peak-meter', PeakMeterProcessor);
 
   dispose() {
     cancelAnimationFrame(this.rafHandle);
+    if (this.autoTimer != null) {
+      clearInterval(this.autoTimer);
+      this.autoTimer = null;
+    }
     for (const id of [...this.voices.keys()]) this.removeTrack(id);
     void this.ctx?.close();
     this.ctx = null;
