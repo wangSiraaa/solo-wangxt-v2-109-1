@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { useWorkbench } from './state/useWorkbench';
 import { Scene3DView } from './components/Scene3DView';
 import { Plan2D } from './components/Plan2D';
@@ -14,6 +14,25 @@ import type { Vec3 } from './types';
 export default function App() {
   const api = useWorkbench();
   const [view, setView] = useState<'3d' | '2d'>('3d');
+
+  // 播放时 2D/3D 场景的位置/朝向取值：
+  //  - 该参数正在人工覆盖 → 用 doc（拖拽实时写入的值），手与画面一致
+  //  - 否则用引擎 live 读数（与 PannerNode/方位读数同源）
+  const displayTracks = useMemo(() => {
+    const live = api.live;
+    if (!live) return api.doc.tracks;
+    return api.doc.tracks.map((tr) => {
+      const t = live.get(tr.id);
+      if (!t) return tr;
+      const ov = api.overrides.get(tr.id)?.params ?? [];
+      return {
+        ...tr,
+        position: !ov.includes('position') && t.position ? { ...t.position } : tr.position,
+        orientation: !ov.includes('orientation') && t.orientation ? { ...t.orientation } : tr.orientation,
+        gain: !ov.includes('gain') && t.gain !== undefined ? t.gain : tr.gain,
+      };
+    });
+  }, [api.doc.tracks, api.live, api.overrides]);
 
   const onMoveSource = useCallback(
     (id: string, pos: Vec3) => api.moveTrack(id, pos),
@@ -81,11 +100,11 @@ export default function App() {
 
         <main className="stage">
           <div className={`view-container ${view === '3d' ? 'show' : ''}`}>
-            <Scene3DView api={api} onMoveSource={onMoveSource} onMoveListener={onMoveListener} />
+            <Scene3DView tracks={displayTracks} api={api} onMoveSource={onMoveSource} onMoveListener={onMoveListener} />
           </div>
           <div className={`view-container ${view === '2d' ? 'show' : ''}`}>
             <Plan2D
-              tracks={api.doc.tracks}
+              tracks={displayTracks}
               listener={api.doc.listener}
               selectedId={api.selectedId}
               onSelect={api.selectTrack}

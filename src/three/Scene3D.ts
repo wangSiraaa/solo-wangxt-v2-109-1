@@ -129,7 +129,10 @@ export function createScene(
   // ---------- 声源 ----------
   interface SourceVisual {
     group: THREE.Group;
+    /** 承载朝向的内部组：位置在外层 group，朝向旋转在内层（标签/圆环不转） */
+    orient: THREE.Group;
     sphere: THREE.Mesh;
+    nose: THREE.Mesh;
     ring: THREE.Mesh;
     label: THREE.Sprite;
     trackId: string;
@@ -171,7 +174,14 @@ export function createScene(
     );
     sphere.position.y = 0.3;
     sphere.castShadow = true;
-    group.add(sphere);
+
+    // 朝向“鼻子”：本地 -Z 方向（与听者/forwardVector 同一约定）
+    const nose = new THREE.Mesh(
+      new THREE.ConeGeometry(0.09, 0.34, 12),
+      new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0x222222, roughness: 0.5 }),
+    );
+    nose.geometry.rotateX(-Math.PI / 2);
+    nose.position.set(0, 0.3, -0.3);
 
     const ring = new THREE.Mesh(
       new THREE.TorusGeometry(0.46, 0.03, 10, 40),
@@ -180,6 +190,11 @@ export function createScene(
     ring.rotation.x = Math.PI / 2;
     ring.position.y = 0.05;
     ring.visible = false;
+
+    const orient = new THREE.Group();
+    orient.add(sphere);
+    orient.add(nose);
+    group.add(orient);
     group.add(ring);
 
     const label = makeTextSprite(track.name, track.color);
@@ -187,9 +202,13 @@ export function createScene(
     group.add(label);
 
     group.position.set(track.position.x, track.position.y, track.position.z);
+    // Three.js 绕 +Y 正角向左转，与 yaw 正值右转相反，取负；俯仰一致
+    orient.rotation.order = 'YXZ';
+    orient.rotation.y = -track.orientation.yaw;
+    orient.rotation.x = track.orientation.pitch;
     group.userData.trackId = track.id;
     scene.add(group);
-    return { group, sphere, ring, label, trackId: track.id };
+    return { group, orient, sphere, nose, ring, label, trackId: track.id };
   }
 
   function disposeVisual(v: SourceVisual) {
@@ -343,6 +362,9 @@ export function createScene(
         sourceVisuals.set(track.id, v);
       }
       v.group.position.set(track.position.x, track.position.y, track.position.z);
+      v.orient.rotation.order = 'YXZ';
+      v.orient.rotation.y = -track.orientation.yaw;
+      v.orient.rotation.x = track.orientation.pitch;
       v.ring.visible = track.id === selectedId;
       const col = new THREE.Color(track.color);
       const muted = track.muted;

@@ -114,6 +114,211 @@ var init_samples = __esm({
   }
 });
 
+// src/lib/automation.ts
+function framesOf(lane, param) {
+  return lane.keyframes.filter((k) => k.param === param);
+}
+function lerp(a, b, f) {
+  return a + (b - a) * f;
+}
+function lerpAngle(a, b, f) {
+  let d = ((b - a) % TWO_PI + TWO_PI) % TWO_PI;
+  if (d > Math.PI) d -= TWO_PI;
+  return a + d * f;
+}
+function wrapPi(a) {
+  let v = (a % TWO_PI + TWO_PI) % TWO_PI;
+  if (v > Math.PI) v -= TWO_PI;
+  return v;
+}
+function valueOf(kf) {
+  if (kf.param === "position") return kf.position;
+  if (kf.param === "orientation") return kf.orientation;
+  return kf.gain;
+}
+function segmentAt(frames, time, period) {
+  if (frames.length === 0) return void 0;
+  const span = period;
+  if (frames.length === 1) return { prev: frames[0], next: frames[0], f: 0 };
+  if (span === void 0) {
+    if (time <= frames[0].time) return { prev: frames[0], next: frames[0], f: 0 };
+    const last2 = frames[frames.length - 1];
+    if (time >= last2.time) return { prev: last2, next: last2, f: 0 };
+  }
+  const phases = frames.map((k) => {
+    let p = k.time;
+    if (span !== void 0) {
+      p = (p % span + span) % span;
+    }
+    return { k, p };
+  });
+  phases.sort((a, b) => a.p - b.p || a.k.createdAt - b.k.createdAt);
+  const t = span !== void 0 ? (time % span + span) % span : time;
+  if (t <= phases[0].p) {
+    if (span === void 0) return { prev: phases[0].k, next: phases[0].k, f: 0 };
+    if (phases[0].p === 0) {
+      const first3 = phases[0];
+      const last3 = phases[phases.length - 1];
+      if (t === 0) return { prev: first3.k, next: first3.k, f: 0 };
+      const d2 = first3.p + span - last3.p;
+      const f3 = (t - last3.p) / d2;
+      return { prev: last3.k, next: first3.k, f: Math.min(1, Math.max(0, f3)) };
+    }
+    const first2 = phases[0];
+    const last2 = phases[phases.length - 1];
+    const f2 = (t + (span - last2.p)) / (first2.p + (span - last2.p));
+    return { prev: last2.k, next: first2.k, f: Math.min(1, Math.max(0, f2)) };
+  }
+  for (let i = 0; i < phases.length - 1; i++) {
+    if (t >= phases[i].p && t <= phases[i + 1].p) {
+      const d2 = phases[i + 1].p - phases[i].p || 1;
+      return { prev: phases[i].k, next: phases[i + 1].k, f: Math.min(1, Math.max(0, (t - phases[i].p) / d2)) };
+    }
+  }
+  if (span === void 0) {
+    const last2 = phases[phases.length - 1];
+    return { prev: last2.k, next: last2.k, f: 0 };
+  }
+  const last = phases[phases.length - 1];
+  const first = phases[0];
+  const d = first.p + (span - last.p);
+  const f = first.p === 0 ? (t - last.p) / d : (t - last.p) / d;
+  return { prev: last.k, next: first.k, f: Math.min(1, Math.max(0, f)) };
+}
+function sampleLane(lane, time, loopPeriod, baseline) {
+  const out = {};
+  if (!lane.enabled) return out;
+  const period = loopPeriod !== void 0 && loopPeriod > 0 ? loopPeriod : void 0;
+  for (const param of ["position", "orientation", "gain"]) {
+    const frames = framesOf(lane, param);
+    if (frames.length === 0) continue;
+    if (period === void 0 && time < frames[0].time) {
+      if (param === "position" && baseline?.position) out.position = { ...baseline.position };
+      else if (param === "orientation" && baseline?.orientation) {
+        out.orientation = { ...baseline.orientation };
+      } else if (param === "gain" && baseline?.gain !== void 0) {
+        out.gain = baseline.gain;
+      }
+      continue;
+    }
+    const seg = segmentAt(frames, time, period);
+    if (!seg) continue;
+    const a = valueOf(seg.prev);
+    const b = valueOf(seg.next);
+    if (param === "position") {
+      const pa = a;
+      const pb = b;
+      out.position = {
+        x: lerp(pa.x, pb.x, seg.f),
+        y: lerp(pa.y, pb.y, seg.f),
+        z: lerp(pa.z, pb.z, seg.f)
+      };
+    } else if (param === "orientation") {
+      const oa = a;
+      const ob = b;
+      out.orientation = {
+        yaw: wrapPi(lerpAngle(oa.yaw, ob.yaw, seg.f)),
+        pitch: lerp(oa.pitch, ob.pitch, seg.f)
+      };
+    } else {
+      out.gain = lerp(a, b, seg.f);
+    }
+  }
+  return out;
+}
+function buildSchedule(spec) {
+  const { lane, fromMedia, toMedia, baseAbsTime, period, baseline } = spec;
+  const events = [];
+  if (!lane.enabled || toMedia <= fromMedia) return { events };
+  const loop = period !== void 0 && period > 0;
+  const span = loop ? period : Infinity;
+  const toAbs = (media) => baseAbsTime + (media - spec.startOffset);
+  const framesOfParam = (p) => lane.keyframes.filter((k) => k.param === p);
+  const kfVal = (paramName, kf) => {
+    if (paramName === "position") {
+      const p = kf.position;
+      return { x: p.x, y: p.y, z: p.z, gain: 0 };
+    }
+    return { x: 0, y: 0, z: 0, gain: kf.gain };
+  };
+  const rampComponents = (paramName, comps) => {
+    const frames = framesOfParam(paramName);
+    if (frames.length === 0) return;
+    const anchors = [];
+    if (!loop) {
+      for (const kf of frames) anchors.push({ media: kf.time, v: kfVal(paramName, kf) });
+    } else {
+      const firstCycle = Math.floor(Math.max(0, fromMedia) / span) - 1;
+      const lastCycle = Math.ceil(toMedia / span) + 1;
+      for (let c = firstCycle; c <= lastCycle; c++) {
+        for (const kf of frames) anchors.push({ media: c * span + kf.time, v: kfVal(paramName, kf) });
+      }
+      anchors.sort((a, b) => a.media - b.media);
+    }
+    const startSample = sampleLane(lane, Math.max(0, fromMedia), loop ? span : void 0, baseline);
+    let startPos;
+    if (paramName === "position" && startSample.position) {
+      startPos = { ...startSample.position, gain: 0 };
+    } else if (paramName === "gain" && startSample.gain !== void 0) {
+      startPos = { x: 0, y: 0, z: 0, gain: startSample.gain };
+    }
+    for (const comp of comps) {
+      const key = comp;
+      let startVal = startPos?.[key];
+      if (startVal === void 0) {
+        continue;
+      }
+      events.push({ component: comp, time: toAbs(fromMedia), value: startVal, kind: "setValue" });
+      for (const a of anchors) {
+        if (a.media < fromMedia - 1e-7 || a.media > toMedia + 1e-7) continue;
+        if (Math.abs(a.media - fromMedia) <= 1e-7) continue;
+        events.push({ component: comp, time: toAbs(a.media), value: a.v[key], kind: "linearRamp" });
+      }
+    }
+  };
+  rampComponents("position", ["x", "y", "z"]);
+  rampComponents("gain", ["gain"]);
+  const oriFrames = framesOfParam("orientation");
+  if (oriFrames.length > 0) {
+    const startSample = sampleLane(lane, Math.max(0, fromMedia), loop ? span : void 0, baseline);
+    if (startSample.orientation) {
+      const f0 = forwardFromOrientation(startSample.orientation.yaw, startSample.orientation.pitch);
+      events.push({ component: "oX", time: toAbs(fromMedia), value: f0.x, kind: "setValue" });
+      events.push({ component: "oY", time: toAbs(fromMedia), value: f0.y, kind: "setValue" });
+      events.push({ component: "oZ", time: toAbs(fromMedia), value: f0.z, kind: "setValue" });
+    }
+    let t = fromMedia + ORIENTATION_SAMPLE_STEP;
+    for (; t <= toMedia + 1e-7; t += ORIENTATION_SAMPLE_STEP) {
+      const s = sampleLane(lane, t, loop ? span : void 0, baseline).orientation;
+      if (!s) continue;
+      const f = forwardFromOrientation(s.yaw, s.pitch);
+      const at = toAbs(t);
+      events.push({ component: "oX", time: at, value: f.x, kind: "setValue" });
+      events.push({ component: "oY", time: at, value: f.y, kind: "setValue" });
+      events.push({ component: "oZ", time: at, value: f.z, kind: "setValue" });
+    }
+  }
+  events.sort(
+    (a, b) => a.component < b.component ? -1 : a.component > b.component ? 1 : a.time - b.time
+  );
+  return { events };
+}
+function forwardFromOrientation(yaw, pitch) {
+  return {
+    x: Math.sin(yaw) * Math.cos(pitch),
+    y: Math.sin(pitch),
+    z: -Math.cos(yaw) * Math.cos(pitch)
+  };
+}
+var TWO_PI, ORIENTATION_SAMPLE_STEP;
+var init_automation = __esm({
+  "src/lib/automation.ts"() {
+    "use strict";
+    TWO_PI = Math.PI * 2;
+    ORIENTATION_SAMPLE_STEP = 1 / 40;
+  }
+});
+
 // src/lib/audioEngine.ts
 var audioEngine_exports = {};
 __export(audioEngine_exports, {
@@ -135,6 +340,7 @@ var init_audioEngine = __esm({
     "use strict";
     init_spatial();
     init_samples();
+    init_automation();
     DecodeError = class extends Error {
       trackId;
       constructor(trackId, message) {
@@ -143,7 +349,7 @@ var init_audioEngine = __esm({
         this.trackId = trackId;
       }
     };
-    AudioEngine = class {
+    AudioEngine = class _AudioEngine {
       ctx = null;
       unlock = "locked";
       busGain = null;
@@ -159,10 +365,25 @@ var init_audioEngine = __esm({
       pendingFiles = /* @__PURE__ */ new Map();
       spatial = null;
       anySolo = false;
+      /** 每轨自动化轨（工程相对时间关键帧），由 UI 层同步 */
+      lanes = /* @__PURE__ */ new Map();
+      /**
+       * 播放中人工拖拽/推子形成的临时覆盖：键存在表示该参数由人工接管，
+       * 自动化调度跳过它。取消覆盖后立刻回到计划轨迹；提交才写入关键帧。
+       */
+      overrides = /* @__PURE__ */ new Map();
+      /** 最近一次调度器输出的媒体时间，供 live 读数与测试断言 */
+      lastMediaTime = /* @__PURE__ */ new Map();
       unlockListeners = /* @__PURE__ */ new Set();
       levelListeners = /* @__PURE__ */ new Set();
       endedListeners = /* @__PURE__ */ new Set();
+      liveListeners = /* @__PURE__ */ new Set();
       rafHandle = 0;
+      /** 调度前瞻窗口（秒）：每个 rAF tick 重排该窗口内的全部 AudioParam 事件 */
+      static SCHEDULE_AHEAD = 0.35;
+      /** live 读数 rAF 节流间隔（秒） */
+      static LIVE_INTERVAL = 1 / 30;
+      lastLiveEmit = 0;
       clipLatchL = false;
       clipLatchR = false;
       lastPeak = { l: 0, r: 0, clipL: false, clipR: false };
@@ -183,6 +404,12 @@ var init_audioEngine = __esm({
         this.endedListeners.add(fn);
         return () => {
           this.endedListeners.delete(fn);
+        };
+      }
+      onLive(fn) {
+        this.liveListeners.add(fn);
+        return () => {
+          this.liveListeners.delete(fn);
         };
       }
       emitUnlock() {
@@ -329,8 +556,14 @@ registerProcessor('peak-meter', PeakMeterProcessor);
               clipR: this.clipLatchR
             };
           }
+          this.tickAutomation();
           const p = this.lastPeak;
           this.levelListeners.forEach((fn) => fn({ ...p }));
+          const now = this.ctx?.currentTime ?? 0;
+          if (now - this.lastLiveEmit >= _AudioEngine.LIVE_INTERVAL) {
+            this.lastLiveEmit = now;
+            this.emitLive();
+          }
           this.rafHandle = requestAnimationFrame(tick);
         };
         this.rafHandle = requestAnimationFrame(tick);
@@ -431,7 +664,12 @@ registerProcessor('peak-meter', PeakMeterProcessor);
           maxDistance: this.spatial?.maxDistance ?? 100,
           positionX: track.position.x,
           positionY: track.position.y,
-          positionZ: track.position.z
+          positionZ: track.position.z,
+          // 声源朝向：与 2D/3D/方位读数共用 forwardVector(yaw,pitch)。
+          // 仅当应用对 PannerNode 设置非默认 cone 时才有声学效果；数值保持三方一致。
+          orientationX: forwardVector(track.orientation.yaw, track.orientation.pitch).x,
+          orientationY: forwardVector(track.orientation.yaw, track.orientation.pitch).y,
+          orientationZ: forwardVector(track.orientation.yaw, track.orientation.pitch).z
         });
         if (buffer.numberOfChannels <= 1) {
           source.connect(trackGain);
@@ -475,16 +713,33 @@ registerProcessor('peak-meter', PeakMeterProcessor);
         if (this.anySolo) return track.solo;
         return true;
       }
-      /** 实时参数更新：不触碰 source 节点 —— 移动声源不会重启音轨 */
+      /**
+       * 实时参数更新：不触碰 source 节点 —— 移动声源不会重启音轨。
+       * 播放中若某参数已被自动化或人工覆盖接管，则跳过该参数，避免两条写入互相打架。
+       */
       updateVoiceLive(voice, track) {
         const ctx = this.ctx;
         const t = ctx.currentTime;
         const tau = Math.max(5e-3, this.spatial?.positionTimeConstant ?? 0.05);
-        voice.panner.positionX.setTargetAtTime(track.position.x, t, tau);
-        voice.panner.positionY.setTargetAtTime(track.position.y, t, tau);
-        voice.panner.positionZ.setTargetAtTime(track.position.z, t, tau);
+        const owner = this.paramOwnership(voice.trackId);
+        if (!voice.playing || !owner.has("position")) {
+          voice.panner.positionX.setTargetAtTime(track.position.x, t, tau);
+          voice.panner.positionY.setTargetAtTime(track.position.y, t, tau);
+          voice.panner.positionZ.setTargetAtTime(track.position.z, t, tau);
+        }
+        if (!voice.playing || !owner.has("orientation")) {
+          const f = forwardVector(track.orientation.yaw, track.orientation.pitch);
+          voice.panner.orientationX.setTargetAtTime(f.x, t, tau);
+          voice.panner.orientationY.setTargetAtTime(f.y, t, tau);
+          voice.panner.orientationZ.setTargetAtTime(f.z, t, tau);
+        }
         voice.panner.distanceModel = this.spatial?.distanceModel ?? voice.panner.distanceModel;
-        voice.trackGain.gain.setTargetAtTime(track.muted ? 0 : track.gain, t, 0.01);
+        const gainOwned = voice.playing && (owner.has("gain") || track.muted);
+        if (!gainOwned) {
+          voice.trackGain.gain.setTargetAtTime(track.muted ? 0 : track.gain, t, 0.01);
+        } else if (track.muted) {
+          voice.trackGain.gain.setTargetAtTime(0, t, 5e-3);
+        }
         if (voice.source.loop !== track.loop) voice.source.loop = track.loop;
         const audible = this.shouldBeAudible(track);
         if (audible !== voice.audiblyRouted) {
@@ -507,7 +762,12 @@ registerProcessor('peak-meter', PeakMeterProcessor);
             v.panner.connect(audible ? this.soloBus : this.muteBus);
             v.audiblyRouted = audible;
           }
-          v.trackGain.gain.setTargetAtTime(tr.muted ? 0 : tr.gain, this.ctx.currentTime, 0.01);
+          const owner = this.paramOwnership(tr.id);
+          if (tr.muted) {
+            v.trackGain.gain.setTargetAtTime(0, this.ctx.currentTime, 5e-3);
+          } else if (!(v.playing && owner.has("gain"))) {
+            v.trackGain.gain.setTargetAtTime(tr.gain, this.ctx.currentTime, 0.01);
+          }
           v.spec = tr;
         }
       }
@@ -544,7 +804,292 @@ registerProcessor('peak-meter', PeakMeterProcessor);
           nv.startedAt = this.ctx.currentTime;
           nv.playing = true;
           nv.consumed = true;
+          this.tickAutomation();
         }
+      }
+      // ---------- 自动化调度 ----------
+      /** UI 层把工程内全部自动化轨同步给引擎（引用替换，不复制关键帧） */
+      setAutomationLanes(lanes) {
+        this.lanes = new Map(Object.entries(lanes));
+      }
+      paramOwnership(trackId) {
+        const owned = /* @__PURE__ */ new Set();
+        const lane = this.lanes.get(trackId);
+        if (lane?.enabled) {
+          if (lane.keyframes.some((k) => k.param === "position")) owned.add("position");
+          if (lane.keyframes.some((k) => k.param === "orientation")) owned.add("orientation");
+          if (lane.keyframes.some((k) => k.param === "gain")) owned.add("gain");
+        }
+        for (const p of this.overrides.get(trackId) ?? []) owned.add(p);
+        return owned;
+      }
+      /** 播放中人工操作开始：该参数进入临时覆盖，立即取消它的自动化计划事件 */
+      beginOverride(trackId, param, value) {
+        const v = this.voices.get(trackId);
+        if (!v || !v.playing) return;
+        let set = this.overrides.get(trackId);
+        if (!set) {
+          set = /* @__PURE__ */ new Set();
+          this.overrides.set(trackId, set);
+        }
+        set.add(param);
+        this.applyOverrideValue(v, param, value);
+      }
+      /** 覆盖过程中持续写入（拖拽移动），不触碰 source */
+      updateOverride(trackId, param, value) {
+        const v = this.voices.get(trackId);
+        if (!v || !v.playing || !this.overrides.get(trackId)?.has(param)) return;
+        this.applyOverrideValue(v, param, value);
+      }
+      applyOverrideValue(v, param, value) {
+        const ctx = this.ctx;
+        const now = ctx.currentTime;
+        const cancel = (p) => {
+          if (!p) return;
+          p.cancelScheduledValues(now);
+        };
+        const smooth = (p, x) => {
+          if (p) {
+            try {
+              p.setTargetAtTime(x, now, Math.max(5e-3, this.spatial?.positionTimeConstant ?? 0.05));
+            } catch {
+              p.setValueAtTime(x, now);
+            }
+          }
+        };
+        if (param === "position") {
+          const pos = value;
+          cancel(v.panner.positionX);
+          cancel(v.panner.positionY);
+          cancel(v.panner.positionZ);
+          smooth(v.panner.positionX, pos.x);
+          smooth(v.panner.positionY, pos.y);
+          smooth(v.panner.positionZ, pos.z);
+        } else if (param === "orientation") {
+          const o = value;
+          const f = forwardVector(o.yaw, o.pitch);
+          cancel(v.panner.orientationX);
+          cancel(v.panner.orientationY);
+          cancel(v.panner.orientationZ);
+          smooth(v.panner.orientationX, f.x);
+          smooth(v.panner.orientationY, f.y);
+          smooth(v.panner.orientationZ, f.z);
+        } else {
+          cancel(v.trackGain.gain);
+          smooth(v.trackGain.gain, v.spec.muted ? 0 : value);
+        }
+      }
+      /** 取消覆盖：返回该参数当前“计划值”供 UI 回弹到轨迹；调度器下一 tick 重排 */
+      cancelOverride(trackId, param) {
+        const set = this.overrides.get(trackId);
+        if (!set) return null;
+        set.delete(param);
+        if (set.size === 0) this.overrides.delete(trackId);
+        const v = this.voices.get(trackId);
+        if (!v) return null;
+        const media = this.currentMediaTime(v);
+        const lane = this.lanes.get(trackId);
+        const s = lane ? sampleLane(lane, media, v.spec.loop ? v.duration : void 0, {
+          position: v.spec.position,
+          orientation: v.spec.orientation,
+          gain: v.spec.muted ? 0 : v.spec.gain
+        }) : {};
+        if (param === "position") {
+          const pos = s.position ?? v.spec.position;
+          this.applyImmediateParam(v, param, pos);
+          return pos;
+        }
+        if (param === "orientation") {
+          const o = s.orientation ?? v.spec.orientation;
+          this.applyImmediateParam(v, param, o);
+          return o;
+        }
+        const g2 = s.gain ?? v.spec.gain;
+        this.applyImmediateParam(v, param, g2);
+        return g2;
+      }
+      /** 提交覆盖后调用：清除该参数覆盖（UI 会把关键帧写入 lane 并同步） */
+      clearOverride(trackId, param) {
+        const set = this.overrides.get(trackId);
+        if (!set) return;
+        set.delete(param);
+        if (set.size === 0) this.overrides.delete(trackId);
+      }
+      /** 暂停/停止/seek/切歌：全部覆盖作废，参数所有权回归工程数据 */
+      clearAllOverrides(trackId) {
+        if (trackId) this.overrides.delete(trackId);
+        else this.overrides.clear();
+      }
+      hasOverride(trackId, param) {
+        return this.overrides.get(trackId)?.has(param) ?? false;
+      }
+      getOverrides(trackId) {
+        return [...this.overrides.get(trackId) ?? []];
+      }
+      applyImmediateParam(v, param, value) {
+        const now = this.ctx.currentTime;
+        if (param === "position") {
+          const p = value;
+          v.panner.positionX.cancelScheduledValues(now);
+          v.panner.positionY.cancelScheduledValues(now);
+          v.panner.positionZ.cancelScheduledValues(now);
+          v.panner.positionX.setValueAtTime(p.x, now);
+          v.panner.positionY.setValueAtTime(p.y, now);
+          v.panner.positionZ.setValueAtTime(p.z, now);
+        } else if (param === "orientation") {
+          const o = value;
+          const f = forwardVector(o.yaw, o.pitch);
+          v.panner.orientationX.cancelScheduledValues(now);
+          v.panner.orientationY.cancelScheduledValues(now);
+          v.panner.orientationZ.cancelScheduledValues(now);
+          v.panner.orientationX.setValueAtTime(f.x, now);
+          v.panner.orientationY.setValueAtTime(f.y, now);
+          v.panner.orientationZ.setValueAtTime(f.z, now);
+        } else {
+          v.trackGain.gain.cancelScheduledValues(now);
+          v.trackGain.gain.setValueAtTime(v.spec.muted ? 0 : value, now);
+        }
+      }
+      currentMediaTime(v) {
+        if (!v.playing) return v.offset;
+        let p = v.offset + (this.ctx.currentTime - v.startedAt);
+        if (v.spec.loop) p = (p % v.duration + v.duration) % v.duration;
+        else p = Math.min(p, v.duration);
+        return p;
+      }
+      /**
+       * 每帧（rAF）对所有播放中的 voice 重排自动化。
+       * 关键设计：
+       *  - 总是先 cancelScheduledValues(now) 再重建前瞻窗口事件，
+       *    seek/暂停后再播、循环回绕都不会叠加旧调度（旧事件在重排时被清掉）。
+       *  - 事件时间一律换算为 AudioContext 绝对时间，浏览器音频线程按时执行，
+       *    不依赖 JS 定时器精度；BufferSource 从不重启。
+       *  - 人工覆盖的参数完全跳过（取消时才回来）。
+       */
+      tickAutomation() {
+        if (!this.ctx) return;
+        for (const [trackId, v] of this.voices) {
+          if (!v.playing) continue;
+          const lane = this.lanes.get(trackId);
+          if (!lane || !lane.enabled || lane.keyframes.length === 0) continue;
+          const now = this.ctx.currentTime;
+          const mediaWrapped = this.currentMediaTime(v);
+          this.lastMediaTime.set(trackId, mediaWrapped);
+          const period = v.spec.loop ? v.duration : void 0;
+          const mediaLinear = v.playing ? v.spec.loop ? v.offset + (now - v.startedAt) : Math.min(v.offset + (now - v.startedAt), v.duration) : v.offset;
+          const schedule = buildSchedule({
+            lane,
+            fromMedia: mediaLinear,
+            toMedia: mediaLinear + _AudioEngine.SCHEDULE_AHEAD,
+            baseAbsTime: v.startedAt,
+            period,
+            startOffset: v.offset,
+            baseline: {
+              position: v.spec.position,
+              orientation: v.spec.orientation,
+              gain: v.spec.muted ? 0 : v.spec.gain
+            }
+          });
+          const overridden = this.overrides.get(trackId) ?? /* @__PURE__ */ new Set();
+          const muted = v.spec.muted;
+          const paramOfComp = (c) => c === "gain" ? "gain" : c === "x" || c === "y" || c === "z" ? "position" : "orientation";
+          const involvedParams = new Set(schedule.events.map((e) => paramOfComp(e.component)));
+          for (const p of involvedParams) {
+            if (overridden.has(p)) continue;
+            if (p === "position") {
+              v.panner.positionX.cancelScheduledValues(now);
+              v.panner.positionY.cancelScheduledValues(now);
+              v.panner.positionZ.cancelScheduledValues(now);
+            } else if (p === "orientation") {
+              v.panner.orientationX.cancelScheduledValues(now);
+              v.panner.orientationY.cancelScheduledValues(now);
+              v.panner.orientationZ.cancelScheduledValues(now);
+            } else {
+              v.trackGain.gain.cancelScheduledValues(now);
+            }
+          }
+          for (const e of schedule.events) {
+            if (e.time < now - 1e-4) continue;
+            const p = paramOfComp(e.component);
+            if (overridden.has(p)) continue;
+            const target = this.automationAudioParam(v, e.component);
+            if (!target) continue;
+            const value = muted && p === "gain" ? 0 : e.value;
+            try {
+              if (e.kind === "setValue") target.setValueAtTime(value, e.time);
+              else target.linearRampToValueAtTime(value, e.time);
+            } catch {
+            }
+          }
+        }
+      }
+      automationAudioParam(v, comp) {
+        if (comp === "x") return v.panner.positionX;
+        if (comp === "y") return v.panner.positionY;
+        if (comp === "z") return v.panner.positionZ;
+        if (comp === "oX") return v.panner.orientationX;
+        if (comp === "oY") return v.panner.orientationY;
+        if (comp === "oZ") return v.panner.orientationZ;
+        if (comp === "gain") return v.trackGain.gain;
+        return null;
+      }
+      /**
+       * 把“实际写进 PannerNode 的东西”作为唯一读数发出：
+       * 未被覆盖的参数直接采样自动化曲线；被覆盖的参数读 AudioParam.value，
+       * 2D/3D/方位显示都消费这一份，保证与实际声像一致。
+       */
+      emitLive() {
+        if (!this.ctx || this.liveListeners.size === 0) return;
+        let any = false;
+        const updates = /* @__PURE__ */ new Map();
+        for (const [trackId, v] of this.voices) {
+          if (!v.playing) continue;
+          any = true;
+          const media = this.currentMediaTime(v);
+          const lane = this.lanes.get(trackId);
+          const sampled = lane ? sampleLane(lane, media, v.spec.loop ? v.duration : void 0, {
+            position: v.spec.position,
+            orientation: v.spec.orientation,
+            gain: v.spec.muted ? 0 : v.spec.gain
+          }) : {};
+          const overridden = this.overrides.get(trackId);
+          const t = { mediaTime: media };
+          const autoActive = lane?.enabled && lane.keyframes.length > 0;
+          if (overridden?.has("position")) {
+            t.position = {
+              x: v.panner.positionX.value,
+              y: v.panner.positionY.value,
+              z: v.panner.positionZ.value
+            };
+          } else if (sampled.position) t.position = sampled.position;
+          else if (autoActive) t.position = { ...v.spec.position };
+          if (overridden?.has("orientation")) {
+            t.orientation = { ...v.spec.orientation };
+          } else if (sampled.orientation) t.orientation = sampled.orientation;
+          else if (autoActive) t.orientation = { ...v.spec.orientation };
+          if (overridden?.has("gain")) t.gain = v.trackGain.gain.value;
+          else if (sampled.gain !== void 0) t.gain = sampled.gain;
+          else if (autoActive) t.gain = v.spec.muted ? 0 : v.spec.gain;
+          updates.set(trackId, t);
+        }
+        if (any) this.liveListeners.forEach((fn) => fn(updates));
+        else {
+          let hasPending = false;
+          for (const v of this.voices.values()) if (v.playing) hasPending = true;
+          if (!hasPending) this.liveListeners.forEach((fn) => fn(null));
+        }
+      }
+      /** 当前媒体时间（秒，循环时回绕）；提交覆盖关键帧的时间戳来源 */
+      getMediaTime(trackId) {
+        return this.getMediaTimeForTest(trackId) ?? 0;
+      }
+      /** 测试用：立即执行一次自动化重排 */
+      runAutomationTickForTest() {
+        this.tickAutomation();
+      }
+      getMediaTimeForTest(trackId) {
+        const v = this.voices.get(trackId);
+        return v ? this.currentMediaTime(v) : void 0;
       }
       // ---------- 传输控制 ----------
       async playTrack(track) {
@@ -561,6 +1106,7 @@ registerProcessor('peak-meter', PeakMeterProcessor);
         voice.startedAt = ctx.currentTime;
         voice.playing = true;
         voice.consumed = true;
+        this.tickAutomation();
       }
       pauseTrack(track) {
         const voice = this.voices.get(track.id);
@@ -590,6 +1136,7 @@ registerProcessor('peak-meter', PeakMeterProcessor);
           nv.startedAt = this.ctx.currentTime;
           nv.playing = true;
           nv.consumed = true;
+          this.tickAutomation();
         }
       }
       /**
@@ -659,6 +1206,8 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 var FakeAudioParam = class {
   value;
   events = [];
+  ramps = [];
+  cancels = [];
   constructor(v) {
     this.value = v;
   }
@@ -666,8 +1215,20 @@ var FakeAudioParam = class {
     this.value = v;
     this.events.push({ time, value: v, tc });
   }
-  setValueAtTime(v) {
+  setValueAtTime(v, time) {
     this.value = v;
+    this.events.push({ time, value: v, tc: 0 });
+  }
+  linearRampToValueAtTime(v, time) {
+    this.ramps.push({ time, value: v });
+  }
+  cancelScheduledValues(time) {
+    this.cancels.push(time);
+    this.events = this.events.filter((e) => e.time < time);
+    this.ramps = this.ramps.filter((e) => e.time < time);
+  }
+  cancelAndHoldAtTime(time) {
+    this.cancelScheduledValues(time);
   }
 };
 var FakeNode = class {
@@ -702,13 +1263,18 @@ var FakePanner = class extends FakeNode {
   positionY = new FakeAudioParam(0);
   positionZ = new FakeAudioParam(0);
   positionTimeConstant = 0;
-  orientationX = new FakeAudioParam(1);
+  orientationX = new FakeAudioParam(0);
+  orientationY = new FakeAudioParam(0);
+  orientationZ = new FakeAudioParam(-1);
   constructor(_ctx, opts = {}) {
     super();
     Object.assign(this, opts);
     if (opts.positionX !== void 0) this.positionX = new FakeAudioParam(opts.positionX);
     if (opts.positionY !== void 0) this.positionY = new FakeAudioParam(opts.positionY);
     if (opts.positionZ !== void 0) this.positionZ = new FakeAudioParam(opts.positionZ);
+    if (opts.orientationX !== void 0) this.orientationX = new FakeAudioParam(opts.orientationX);
+    if (opts.orientationY !== void 0) this.orientationY = new FakeAudioParam(opts.orientationY);
+    if (opts.orientationZ !== void 0) this.orientationZ = new FakeAudioParam(opts.orientationZ);
   }
 };
 var FakeBufferSource = class extends FakeNode {
@@ -832,6 +1398,7 @@ function baseTrack(over = {}) {
     channel: 0,
     color: "#fff",
     position: { x: 2, y: 0, z: 0 },
+    orientation: { yaw: 0, pitch: 0 },
     status: "pending",
     ...over
   };
@@ -964,5 +1531,111 @@ describe("AudioEngine \u56FE\u884C\u4E3A\uFF08\u6A21\u62DF\u73AF\u5883\uFF09", (
     const buf = createSampleBuffer2(engine.ctx, "pulse");
     assert.equal(buf.numberOfChannels, 1);
     assert.ok(Math.abs(buf.duration - 1.6) < 1e-6);
+  });
+  function automationLane(trackId) {
+    return {
+      trackId,
+      version: 1,
+      enabled: true,
+      revisionSeq: 3,
+      revisions: [],
+      keyframes: [
+        { id: "kf1", time: 0, param: "position", position: { x: -3, y: 0, z: 0 }, createdAt: 0 },
+        { id: "kf2", time: 0.5, param: "position", position: { x: 3, y: 0, z: 0 }, createdAt: 0 },
+        { id: "kf3", time: 0.2, param: "gain", gain: 0.2, createdAt: 0 },
+        { id: "kf4", time: 0.55, param: "gain", gain: 1, createdAt: 0 }
+      ]
+    };
+  }
+  it("\u64AD\u653E\u81EA\u52A8\u5316\uFF1A\u4F4D\u7F6E/\u589E\u76CA\u6309 AudioContext \u65F6\u949F\u6392\u5165 AudioParam\uFF0Csource \u4E0D\u91CD\u542F", async () => {
+    await engine.resume();
+    const t = { ...baseTrack(), loop: false, position: { x: -3, y: 0, z: 0 } };
+    engine.setAutomationLanes({ t1: automationLane("t1") });
+    await engine.playTrack(t);
+    const v = engine.voices.get("t1");
+    const starts = v.source.started.length;
+    assert.ok(v.panner.positionX.events.some((e) => Math.abs(e.value - -3) < 1e-9));
+    const ctx = engine.ctx;
+    ctx.currentTime = 0.2;
+    engine.runAutomationTickForTest();
+    assert.equal(v.source.started.length, starts);
+    assert.equal(v.source.stopped, 0);
+    ctx.currentTime = 0.4;
+    engine.runAutomationTickForTest();
+    const xRampTo3 = v.panner.positionX.ramps.some(
+      (r) => Math.abs(r.time - 0.5) < 1e-9 && Math.abs(r.value - 3) < 1e-9
+    );
+    assert.ok(xRampTo3, "x \u5E94\u5728 0.5s \u7EBF\u6027 ramp \u5230 +3");
+    const gainRampToOne = v.trackGain.gain.ramps.some(
+      (r) => Math.abs(r.time - 0.55) < 1e-9 && Math.abs(r.value - 1) < 1e-9
+    );
+    assert.ok(gainRampToOne, "gain \u5E94\u5728 0.55s ramp \u5230 1");
+    assert.equal(v.source.started.length, 1);
+    assert.equal(v.source.stopped, 0);
+  });
+  it("\u6682\u505C\u2192seek\u2192\u518D\u64AD\uFF1A\u65E7\u8C03\u5EA6\u968F\u8282\u70B9\u9500\u6BC1\uFF0C\u65B0\u8282\u70B9\u91CD\u65B0\u8C03\u5EA6\uFF0C\u4E0D\u53E0\u52A0/\u4E0D\u91CD\u590D\u53D1\u58F0", async () => {
+    await engine.resume();
+    const t = { ...baseTrack(), loop: false };
+    engine.setAutomationLanes({ t1: automationLane("t1") });
+    await engine.playTrack(t);
+    const ctx = engine.ctx;
+    ctx.currentTime = 0.1;
+    engine.runAutomationTickForTest();
+    engine.pauseTrack(t);
+    await engine.seekTrack(t, 0.3, false);
+    const voices1 = engine.voices;
+    const before = voices1.get("t1").source;
+    assert.equal(before.started.length, 0, "seek \u540E\u672A\u64AD\u653E\u7684 source \u4E0D\u5E94 start");
+    await engine.playTrack(t);
+    const after = voices1.get("t1").source;
+    assert.equal(after.started.length, 1);
+    const px = voices1.get("t1").panner.positionX;
+    const times = px.events.map((e) => e.time);
+    assert.ok(times.every((tm) => tm >= 0, 1e-9), "\u4E0D\u5E94\u51FA\u73B0 seek \u524D\u5A92\u4F53\u65F6\u95F4\u7684\u65E7\u4E8B\u4EF6");
+  });
+  it("\u5FAA\u73AF\u64AD\u653E\uFF1A\u8DE8\u56DE\u7ED5\u8FB9\u754C\u7684\u4F4D\u7F6E\u5305\u7EDC\u5468\u671F\u91CD\u590D\uFF0C\u4E14\u4E0D\u91CD\u542F source", async () => {
+    await engine.resume();
+    const ctx = engine.ctx;
+    const t = { ...baseTrack(), loop: true, position: { x: 0, y: 0, z: 0 } };
+    const lane = {
+      trackId: "t1",
+      version: 1,
+      enabled: true,
+      revisionSeq: 1,
+      revisions: [],
+      keyframes: [
+        { id: "a", time: 0, param: "position", position: { x: 0, y: 0, z: 0 }, createdAt: 0 },
+        { id: "b", time: 0.5, param: "position", position: { x: 2, y: 0, z: 0 }, createdAt: 0 }
+      ]
+    };
+    engine.setAutomationLanes({ t1: lane });
+    await engine.playTrack(t);
+    const v = engine.voices.get("t1");
+    ctx.currentTime = 2.9;
+    engine.runAutomationTickForTest();
+    let rampTimes = v.panner.positionX.ramps.map((r) => r.time);
+    assert.ok(rampTimes.some((tm) => Math.abs(tm - 3) < 1e-6), "\u56DE\u7ED5\u70B9 3.0s \u5E94\u91CD\u6392 x=0");
+    ctx.currentTime = 3.2;
+    engine.runAutomationTickForTest();
+    rampTimes = v.panner.positionX.ramps.map((r) => r.time);
+    assert.ok(rampTimes.some((tm) => Math.abs(tm - 3.5) < 1e-6), "\u4E0B\u4E00\u5468\u671F 3.5s \u5E94\u91CD\u6392 x=2");
+    assert.equal(v.source.started.length, 1);
+    assert.equal(v.source.stopped, 0);
+  });
+  it("\u64AD\u653E\u4E2D\u4EBA\u5DE5\u8986\u76D6\u63A5\u7BA1\u4F4D\u7F6E\u53C2\u6570\uFF1B\u53D6\u6D88\u540E\u56DE\u5230\u8BA1\u5212\u503C\uFF1B\u63D0\u4EA4\u6E05\u9664\u8986\u76D6", async () => {
+    await engine.resume();
+    const ctx = engine.ctx;
+    const t = { ...baseTrack(), loop: false, position: { x: -3, y: 0, z: 0 } };
+    engine.setAutomationLanes({ t1: automationLane("t1") });
+    await engine.playTrack(t);
+    ctx.currentTime = 0.4;
+    engine.beginOverride("t1", "position", { x: 10, y: 1, z: 2 });
+    const v = engine.voices.get("t1");
+    assert.equal(engine.hasOverride("t1", "position"), true);
+    engine.runAutomationTickForTest();
+    assert.ok(Math.abs(v.panner.positionX.value - 10) < 1e-9);
+    const planned = engine.cancelOverride("t1", "position");
+    assert.ok(Math.abs(planned.x - 1.8) < 1e-6, `\u8BA1\u5212x\u5E94\u22481.8\uFF0C\u5B9E\u9645 ${planned.x}`);
+    assert.equal(engine.hasOverride("t1", "position"), false);
   });
 });

@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ListenerState, Track, Vec3 } from '../types';
 import { rightVector, forwardVector } from '../lib/spatial';
-
 interface Props {
   tracks: Track[];
   listener: ListenerState;
@@ -135,6 +134,12 @@ export function Plan2D({
         {/* 声源 */}
         {tracks.map((t) => {
           const selected = t.id === selectedId;
+          // 声源朝向刻度：本地前向经 yaw 旋转（pitch 不反映在俯视图）
+          const sf = forwardVector(t.orientation.yaw, 0);
+          const tx0 = toX(t.position.x);
+          const ty0 = toY(t.position.z);
+          const tx1 = toX(t.position.x + sf.x * 0.42);
+          const ty1 = toY(t.position.z + sf.z * 0.42);
           return (
             <g
               key={t.id}
@@ -148,6 +153,16 @@ export function Plan2D({
               {selected && (
                 <circle cx={toX(t.position.x)} cy={toY(t.position.z)} r={14} fill="none" stroke="#fff" strokeWidth={1.5} />
               )}
+              <line
+                x1={tx0}
+                y1={ty0}
+                x2={tx1}
+                y2={ty1}
+                stroke={t.muted ? '#555a63' : '#ffffff'}
+                strokeWidth={2}
+                strokeLinecap="round"
+                opacity={0.9}
+              />
               <circle
                 cx={toX(t.position.x)}
                 cy={toY(t.position.z)}

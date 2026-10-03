@@ -744,3 +744,246 @@ input[type='range'] {
   align-items: center;
   max-width: 600px;
 }
+
+/* ---------- 实时/自动化标记 ---------- */
+.live-badge {
+  font-size: 10px;
+  color: #0b0e13;
+  background: var(--accent);
+  border-radius: 999px;
+  padding: 1px 7px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.live-tag {
+  font-style: normal;
+  font-size: 9px;
+  color: var(--accent);
+  margin-left: 3px;
+}
+
+/* ---------- 每轨自动化 ---------- */
+.automation-lane {
+  border-top: 1px dashed var(--border);
+  padding-top: 5px;
+}
+.lane-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+.lane-toggle {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 2px 0;
+  text-align: left;
+}
+.lane-toggle:hover {
+  color: var(--text);
+}
+.lane-count {
+  margin-left: 6px;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent-2);
+}
+.lane-enable {
+  font-size: 10px;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+.lane-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 4px;
+}
+.lane-actions,
+.lane-time-input,
+.inspector-kf-actions {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.lane-time-input input {
+  width: 78px;
+  background: #0d1118;
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 2px 5px;
+  font-size: 11px;
+}
+.lane-error {
+  font-size: 10px;
+  color: var(--danger);
+  background: rgba(248, 113, 113, 0.1);
+  border-radius: 4px;
+  padding: 3px 6px;
+  margin-top: 4px;
+}
+.lane-timeline {
+  position: relative;
+  height: 30px;
+  background: #0d1118;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+.lane-playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--accent);
+  opacity: 0.8;
+  pointer-events: none;
+}
+.lane-kf {
+  position: absolute;
+  top: 3px;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+}
+.lane-kf-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  border: 1.5px solid #0b0e13;
+  outline: 1px solid var(--border);
+}
+.lane-kf-time {
+  width: 44px;
+  background: rgba(13, 17, 24, 0.85);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 3px;
+  font-size: 9px;
+  padding: 0 2px;
+  text-align: center;
+}
+.lane-kf-del {
+  position: absolute;
+  top: -5px;
+  right: -12px;
+  background: none;
+  border: none;
+  color: var(--danger);
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1;
+  padding: 0;
+}
+.lane-legend {
+  display: flex;
+  gap: 10px;
+  font-size: 10px;
+  color: var(--muted);
+}
+.lane-legend i {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  margin-right: 3px;
+}
+.lane-frames {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 110px;
+  overflow: auto;
+}
+.lane-frame-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+.lane-frame-param {
+  font-weight: 700;
+  min-width: 28px;
+}
+.lane-frame-time {
+  color: var(--accent-2);
+  min-width: 52px;
+}
+.lane-frame-value {
+  color: var(--muted);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lane-history summary {
+  cursor: pointer;
+}
+.lane-history ul {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 120px;
+  overflow: auto;
+}
+.lane-rev {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  font-size: 10px;
+  color: var(--muted);
+}
+.lane-rev b {
+  color: var(--accent);
+}
+.lane-rev-action {
+  border-radius: 3px;
+  padding: 0 4px;
+  font-size: 9px;
+  text-transform: uppercase;
+}
+.lane-rev-action.commit {
+  color: var(--accent-2);
+}
+.lane-rev-action.undo {
+  color: var(--warn);
+}
+.lane-rev-action.clear {
+  color: var(--danger);
+}
+
+/* ---------- 播放中临时覆盖 ---------- */
+.override-banner {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  align-items: center;
+  background: rgba(255, 224, 102, 0.1);
+  border: 1px solid rgba(255, 224, 102, 0.45);
+  border-radius: 5px;
+  padding: 5px 6px;
+  font-size: 10px;
+}
+.override-title {
+  color: var(--warn);
+  font-weight: 700;
+  width: 100%;
+}
+.override-actions {
+  display: inline-flex;
+  gap: 3px;
+}

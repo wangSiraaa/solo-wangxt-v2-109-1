@@ -9,8 +9,10 @@ import {
   gainToDb,
   relativeAzimuth,
 } from '../lib/spatial';
-import type { ListenerState, SpatialSettings } from '../types';
+import type { ListenerState, SpatialSettings, Vec3 } from '../types';
 import type { WorkbenchApi } from '../state/useWorkbench';
+import { AutomationLanePanel } from './AutomationLane';
+import { OverrideBanner } from './OverrideBanner';
 
 interface Props {
   track: Track;
@@ -25,7 +27,7 @@ function fmt(t: number | null): string {
 }
 
 export function TrackRow({ track, api }: Props) {
-  const { doc, playingIds } = api;
+  const { doc, playingIds, live } = api;
   const playing = playingIds.has(track.id);
   const [progress, setProgress] = useState(0);
   const listener: ListenerState = doc.listener;
@@ -46,9 +48,20 @@ export function TrackRow({ track, api }: Props) {
     return () => cancelAnimationFrame(raf);
   }, [playing, track.id]);
 
-  const az = relativeAzimuth(track.position, listener);
-  const dist = distanceTo(track.position, listener.position);
-  const elev = elevationAngle(track.position, listener.position);
+  // 实际声像：播放中未覆盖的参数以引擎 live 读数为准（与 PannerNode 同源），
+  // 正在人工覆盖的参数用 doc（拖拽/推子实时值）；2D/3D、方位与增益读数消费这一份
+  const t = live?.get(track.id);
+  const ov = api.overrides.get(track.id)?.params ?? [];
+  const displayTrack: Track = {
+    ...track,
+    position: !ov.includes('position') && t?.position ? { ...(t.position as Vec3) } : track.position,
+    orientation: !ov.includes('orientation') && t?.orientation ? { ...t.orientation } : track.orientation,
+    gain: !ov.includes('gain') && t?.gain !== undefined ? t.gain : track.gain,
+  };
+
+  const az = relativeAzimuth(displayTrack.position, listener);
+  const dist = distanceTo(displayTrack.position, listener.position);
+  const elev = elevationAngle(displayTrack.position, listener.position);
   const dGain = distanceGain(
     dist,
     spatial.distanceModel,
@@ -136,8 +149,13 @@ export function TrackRow({ track, api }: Props) {
           value={track.gain}
           onChange={(e) => api.updateTrack(track.id, { gain: Number(e.target.value) })}
         />
-        <span className="gain-readout">{gainToDb(track.muted ? 0 : track.gain)}</span>
+        <span className="gain-readout">
+          {gainToDb(track.muted ? 0 : displayTrack.gain)}
+          {t?.gain !== undefined && <em className="live-tag">实时</em>}
+        </span>
       </div>
+
+      <OverrideBanner track={track} api={api} />
 
       <div
         className="track-progress"
@@ -161,7 +179,12 @@ export function TrackRow({ track, api }: Props) {
         <span title="距离模型造成的理论衰减（真实衰减由 PannerNode 执行）">
           距离增益 {gainToDb(dGain)}
         </span>
+        {playing && (t?.position || t?.orientation || t?.gain !== undefined) && (
+          <span className="live-badge">自动化</span>
+        )}
       </div>
+
+      <AutomationLanePanel track={track} api={api} progress={progress} />
 
       {track.channels && track.channels > 1 ? (
         <div className="track-channel">

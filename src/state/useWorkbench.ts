@@ -1,18 +1,37 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
+  AutomationLane,
+  AutomationParam,
   LevelState,
   ListenerState,
+  LiveTransform,
   NamedProject,
+  Orientation,
   ProjectDoc,
   SourceType,
   SpatialSettings,
   Track,
   UnlockState,
+  Vec3,
 } from '../types';
 import { engine } from '../lib/engineInstance';
 import { DecodeError } from '../lib/audioEngine';
 import * as idb from '../lib/idb';
 import { SAMPLE_LABELS } from '../lib/samples';
+import {
+  AutomationError,
+  commitKeyframe,
+  deleteKeyframe as laneDeleteKeyframe,
+  emptyLane,
+  laneFor,
+  migrateDoc,
+  moveKeyframe as laneMoveKeyframe,
+  sampleLane,
+  setEnabled as laneSetEnabled,
+  clearKeyframes as laneClearKeyframes,
+  undoLast as laneUndoLast,
+  updateKeyframeValue as laneUpdateKeyframeValue,
+} from '../lib/automation';
 
 const COLORS = ['#e8734a', '#4ecdc4', '#ffe066', '#a78bfa', '#f472b6', '#34d399', '#60a5fa'];
 
@@ -57,20 +76,36 @@ function sampleTrack(type: Exclude<SourceType, 'file'>, index: number): Track {
     channel: 0,
     color: COLORS[index % COLORS.length],
     position: { ...p.position },
+    orientation: { yaw: 0, pitch: 0 },
     status: 'pending',
   };
 }
 
 function emptyDoc(): ProjectDoc {
   return {
-    version: 1,
+    version: 2,
     tracks: [],
+    automation: {},
     listener: { ...DEFAULT_LISTENER, position: { ...DEFAULT_LISTENER.position } },
     spatial: { ...DEFAULT_SPATIAL },
     busGain: 1,
     masterGain: 0.9,
     savedAt: 0,
   };
+}
+
+export interface AutomationFrameInput {
+  time: number;
+  param: AutomationParam;
+  position?: Vec3;
+  orientation?: Orientation;
+  gain?: number;
+}
+
+/** 播放中人工拖拽产生的临时覆盖（仅对正在播放的声轨存在） */
+export interface OverrideState {
+  trackId: string;
+  params: AutomationParam[];
 }
 
 export interface WorkbenchApi {
@@ -85,6 +120,10 @@ export interface WorkbenchApi {
   loadedProjectName: string | null;
   saveState: 'idle' | 'saving' | 'saved';
   globalError: string | null;
+  /** 播放中实际声像（2D/3D/方位/增益读数共用），无播放声轨时为 null */
+  live: Map<string, LiveTransform> | null;
+  /** 正在临时覆盖自动化的声轨及其参数 */
+  overrides: Map<string, OverrideState>;
   selectTrack: (id: string | null) => void;
   unlockAudio: () => Promise<void>;
   addSample: (type: Exclude<SourceType, 'file'>) => Promise<void>;
@@ -92,6 +131,7 @@ export interface WorkbenchApi {
   removeTrack: (id: string) => Promise<void>;
   updateTrack: (id: string, patch: Partial<Track>) => void;
   moveTrack: (id: string, position: Track['position']) => void;
+  setOrientation: (id: string, orientation: Orientation) => void;
   setListener: (
     patch:
       | Partial<Omit<ListenerState, 'position'>>
@@ -113,6 +153,31 @@ export interface WorkbenchApi {
   deleteProject: (id: string) => Promise<void>;
   newProject: () => Promise<void>;
   dismissGlobalError: () => void;
+  // ---- 每轨空间自动化 ----
+  lane: (trackId: string) => AutomationLane;
+  commitFrame: (trackId: string, frame: AutomationFrameInput) => { ok: boolean; error?: string };
+  deleteFrame: (trackId: string, keyframeId: string) => { ok: boolean; error?: string };
+  moveFrame: (trackId: string, keyframeId: string, time: number) => { ok: boolean; error?: string };
+  updateFrameValue: (
+    trackId: string,
+    keyframeId: string,
+    value: { position?: Vec3; orientation?: Orientation; gain?: number },
+  ) => { ok: boolean; error?: string };
+  setLaneEnabled: (trackId: string, enabled: boolean) => void;
+  clearFrames: (trackId: string) => { ok: boolean; error?: string };
+  undoAutomation: (trackId: string) => { ok: boolean; error?: string };
+  /** 采样某轨在工程时间 time 的计划值（Inspector/覆盖回弹共用） */
+  plannedAt: (track: Track, time: number) => { position: Vec3; orientation: Orientation; gain: number };
+  // ---- 播放中人工覆盖 ----
+  armOverride: (trackId: string, param: AutomationParam, value: Vec3 | Orientation | number) => void;
+  updateOverrideValue: (
+    trackId: string,
+    param: AutomationParam,
+    value: Vec3 | Orientation | number,
+  ) => void;
+  cancelOverride: (trackId: string, param: AutomationParam) => void;
+  commitOverride: (trackId: string, param: AutomationParam) => { ok: boolean; error?: string };
+  cancelAllOverrides: (trackId: string) => void;
 }
 
 export function useWorkbench(): WorkbenchApi {
@@ -127,9 +192,13 @@ export function useWorkbench(): WorkbenchApi {
   const [loadedProjectName, setLoadedProjectName] = useState<string | null>(null);
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved'>('idle');
   const [globalError, setGlobalError] = useState<string | null>(null);
+  const [live, setLive] = useState<Map<string, LiveTransform> | null>(null);
+  const [overrideMap, setOverrideMap] = useState<Map<string, OverrideState>>(new Map());
 
   const docRef = useRef(doc);
   docRef.current = doc;
+  const overrideRef = useRef(overrideMap);
+  overrideRef.current = overrideMap;
   const initDone = useRef(false);
 
   // ---------- 初始化：恢复会话与工程列表，绝不自动播放 ----------
@@ -144,16 +213,20 @@ export function useWorkbench(): WorkbenchApi {
         if (cancelled) return;
         if (list) setProjects(list);
         if (session) {
+          // v1→v2 迁移：补自动化轨/声源朝向；脏数据在 migrateDoc 内被健壮化。
           // 恢复全部参数，但播放状态一律归零（不擅自自动播放）。
           // 文件轨标记 pending，待音频解锁后重新注入 Blob 解码。
-          setDoc({
-            ...session,
-            tracks: session.tracks.map((t) => ({
-              ...t,
-              status: 'pending',
-              errorMessage: undefined,
-            })),
-          });
+          const migrated = migrateDoc(session);
+          if (migrated) {
+            setDoc({
+              ...migrated,
+              tracks: migrated.tracks.map((t) => ({
+                ...t,
+                status: 'pending',
+                errorMessage: undefined,
+              })),
+            });
+          }
         }
       } catch (err) {
         if (!cancelled) {
@@ -169,9 +242,18 @@ export function useWorkbench(): WorkbenchApi {
   // ---------- 引擎事件订阅 ----------
   useEffect(() => engine.onUnlock(setUnlock), []);
   useEffect(() => engine.onLevels(setLevels), []);
+  useEffect(() => engine.onLive(setLive), []);
 
   useEffect(() => {
     return engine.onEnded((trackId) => {
+      // 自然结束：临时覆盖随播放结束作废（参数所有权回归静态值）
+      engine.clearAllOverrides(trackId);
+      setOverrideMap((prev) => {
+        if (!prev.has(trackId)) return prev;
+        const next = new Map(prev);
+        next.delete(trackId);
+        return next;
+      });
       setPlayingIds((prev) => {
         if (!prev.has(trackId)) return prev;
         const next = new Set(prev);
@@ -204,6 +286,11 @@ export function useWorkbench(): WorkbenchApi {
     engine.syncTracks(doc.tracks);
   }, [doc.tracks]);
 
+  // 自动化轨同步到引擎（仅替换引用；调度在 AudioContext 时钟上做）
+  useEffect(() => {
+    engine.setAutomationLanes(doc.automation);
+  }, [doc.automation]);
+
   // ---------- 解锁后：同步全部声轨（解码/合成 + 参数），但不播放 ----------
   useEffect(() => {
     if (unlock !== 'unlocked') return;
@@ -215,8 +302,9 @@ export function useWorkbench(): WorkbenchApi {
       engine.setBusGain(docRef.current.busGain);
       engine.setMasterGain(docRef.current.masterGain);
 
-      // 注入文件 Blob
+      // 注入文件 Blob（逐个容错：单个 Blob 读取失败不阻断其他轨）
       for (const t of docRef.current.tracks) {
+        if (cancelled) return;
         if (t.sourceType === 'file' && t.blobKey && t.status !== 'ready') {
           try {
             const blob = await idb.getBlob(t.blobKey);
@@ -253,6 +341,12 @@ export function useWorkbench(): WorkbenchApi {
           if (cancelled) return;
           if (err instanceof DecodeError) {
             patchTrack(t.id, { status: 'decode-error', errorMessage: err.message });
+          } else {
+            // 其他合成失败也只标记该轨，绝不阻断其他轨
+            patchTrack(t.id, {
+              status: 'decode-error',
+              errorMessage: err instanceof Error ? err.message : String(err),
+            });
           }
         }
       }
@@ -290,6 +384,42 @@ export function useWorkbench(): WorkbenchApi {
       ...d,
       tracks: d.tracks.map((t) => (t.id === id ? { ...t, ...patch } : t)),
     }));
+  }
+
+  function addOverrideParam(trackId: string, param: AutomationParam) {
+    setOverrideMap((prev) => {
+      const cur = prev.get(trackId);
+      if (cur?.params.includes(param)) return prev;
+      const next = new Map(prev);
+      next.set(trackId, {
+        trackId,
+        params: cur ? [...cur.params, param] : [param],
+      });
+      return next;
+    });
+  }
+
+  function removeOverrideParamState(trackId: string, param: AutomationParam) {
+    setOverrideMap((prev) => {
+      const cur = prev.get(trackId);
+      if (!cur) return prev;
+      const params = cur.params.filter((p) => p !== param);
+      const next = new Map(prev);
+      if (params.length === 0) next.delete(trackId);
+      else next.set(trackId, { trackId, params });
+      return next;
+    });
+  }
+
+  /** 暂停/停止/seek/切歌后：覆盖全部作废（参数所有权回归工程数据） */
+  function resetOverridesForTransport(trackId: string) {
+    engine.clearAllOverrides(trackId);
+    setOverrideMap((prev) => {
+      if (!prev.has(trackId)) return prev;
+      const next = new Map(prev);
+      next.delete(trackId);
+      return next;
+    });
   }
 
   const selectTrack = useCallback((id: string | null) => setSelectedId(id), []);
@@ -357,6 +487,7 @@ export function useWorkbench(): WorkbenchApi {
             y: 0,
             z: Math.sin((idx * 2 * Math.PI) / Math.max(arr.length, 1)) * 2.5,
           },
+          orientation: { yaw: 0, pitch: 0 },
           status: engine.unlock === 'unlocked' ? 'loading' : 'pending',
         };
         setDoc((d) => ({ ...d, tracks: [...d.tracks, track] }));
@@ -412,12 +543,24 @@ export function useWorkbench(): WorkbenchApi {
         /* 忽略清理失败 */
       }
     }
+    engine.clearAllOverrides(id);
     setPlayingIds((prev) => {
       const next = new Set(prev);
       next.delete(id);
       return next;
     });
-    setDoc((d) => ({ ...d, tracks: d.tracks.filter((x) => x.id !== id) }));
+    setOverrideMap((prev) => {
+      if (!prev.has(id)) return prev;
+      const next = new Map(prev);
+      next.delete(id);
+      return next;
+    });
+    setDoc((d) => {
+      if (!d.automation[id]) return { ...d, tracks: d.tracks.filter((x) => x.id !== id) };
+      const automation = { ...d.automation };
+      delete automation[id];
+      return { ...d, tracks: d.tracks.filter((x) => x.id !== id), automation };
+    });
     setSelectedId((cur) => (cur === id ? null : cur));
   }, []);
 
@@ -425,6 +568,19 @@ export function useWorkbench(): WorkbenchApi {
     (id: string, patch: Partial<Track>) => {
       const prev = docRef.current.tracks.find((x) => x.id === id);
       patchTrack(id, patch);
+      // 播放中拖增益推子 = 对 gain 的显式临时覆盖（不篡改自动化曲线）
+      if (
+        prev &&
+        patch.gain !== undefined &&
+        patch.gain !== prev.gain &&
+        engine.isPlaying(id) &&
+        !engine.hasOverride(id, 'gain') &&
+        laneFor(docRef.current, id).enabled &&
+        laneFor(docRef.current, id).keyframes.some((k) => k.param === 'gain')
+      ) {
+        engine.beginOverride(id, 'gain', patch.gain);
+        addOverrideParam(id, 'gain');
+      }
       // 切换所选输入声道需要重建输入图（splitter 接线改变）
       if (
         prev &&
@@ -444,9 +600,39 @@ export function useWorkbench(): WorkbenchApi {
   );
 
   const moveTrack = useCallback((id: string, position: Track['position']) => {
+    // 播放中拖拽：若该轨有位置自动化，进入临时覆盖；否则只是普通静态移动
+    if (
+      engine.isPlaying(id) &&
+      !engine.hasOverride(id, 'position') &&
+      laneFor(docRef.current, id).enabled &&
+      laneFor(docRef.current, id).keyframes.some((k) => k.param === 'position')
+    ) {
+      engine.beginOverride(id, 'position', position);
+      addOverrideParam(id, 'position');
+    } else if (engine.hasOverride(id, 'position')) {
+      engine.updateOverride(id, 'position', position);
+    }
     setDoc((d) => ({
       ...d,
       tracks: d.tracks.map((t) => (t.id === id ? { ...t, position: { ...position } } : t)),
+    }));
+  }, []);
+
+  const setOrientation = useCallback((id: string, orientation: Orientation) => {
+    if (
+      engine.isPlaying(id) &&
+      !engine.hasOverride(id, 'orientation') &&
+      laneFor(docRef.current, id).enabled &&
+      laneFor(docRef.current, id).keyframes.some((k) => k.param === 'orientation')
+    ) {
+      engine.beginOverride(id, 'orientation', orientation);
+      addOverrideParam(id, 'orientation');
+    } else if (engine.hasOverride(id, 'orientation')) {
+      engine.updateOverride(id, 'orientation', orientation);
+    }
+    setDoc((d) => ({
+      ...d,
+      tracks: d.tracks.map((t) => (t.id === id ? { ...t, orientation: { ...orientation } } : t)),
     }));
   }, []);
 
@@ -507,6 +693,7 @@ export function useWorkbench(): WorkbenchApi {
   const pause = useCallback((id: string) => {
     const t = docRef.current.tracks.find((x) => x.id === id);
     if (!t) return;
+    resetOverridesForTransport(id);
     engine.pauseTrack(t);
     setPlayingIds((prev) => {
       const next = new Set(prev);
@@ -518,6 +705,7 @@ export function useWorkbench(): WorkbenchApi {
   const stop = useCallback((id: string) => {
     const t = docRef.current.tracks.find((x) => x.id === id);
     if (!t) return;
+    resetOverridesForTransport(id);
     engine.stopTrack(t);
     setPlayingIds((prev) => {
       const next = new Set(prev);
@@ -530,6 +718,8 @@ export function useWorkbench(): WorkbenchApi {
     async (id: string, offsetSec: number) => {
       const t = docRef.current.tracks.find((x) => x.id === id);
       if (!t) return;
+      // seek 会重建 source：所有临时覆盖作废，旧节点的自动化调度随节点销毁
+      resetOverridesForTransport(id);
       const wasPlaying = engine.isPlaying(id);
       await engine.seekTrack(t, offsetSec, wasPlaying);
       setPlayingIds((prev) => {
@@ -567,7 +757,9 @@ export function useWorkbench(): WorkbenchApi {
 
   const stopAll = useCallback(() => {
     for (const t of docRef.current.tracks) engine.stopTrack(t);
+    engine.clearAllOverrides();
     setPlayingIds(new Set());
+    setOverrideMap(new Map());
   }, []);
 
   const clearClips = useCallback(() => {
@@ -603,26 +795,34 @@ export function useWorkbench(): WorkbenchApi {
       if (!p) return;
       // 先拆除当前声轨节点
       for (const t of docRef.current.tracks) engine.removeTrack(t.id);
+      engine.clearAllOverrides();
       setPlayingIds(new Set());
-      const restored: ProjectDoc = {
-        ...p.doc,
-        tracks: p.doc.tracks.map((t) => ({
-          ...t,
-          // 内置样例可重建；文件声轨等待 Blob 注入解码；不自动播放
-          status: t.sourceType === 'file' ? 'pending' : 'pending',
-        })),
+      setOverrideMap(new Map());
+      // v1 工程迁移与健壮化（自动化/朝向）；失败的单轨不阻断整份载入
+      const restored = migrateDoc(p.doc);
+      if (!restored) {
+        setGlobalError('工程文件已损坏，无法载入');
+        return;
+      }
+      const doc: ProjectDoc = {
+        ...restored,
+        tracks: restored.tracks.map((t) => ({ ...t, status: 'pending' as const })),
       };
-      setDoc(restored);
+      setDoc(doc);
       setLoadedProjectId(p.id);
       setLoadedProjectName(p.name);
       setSelectedId(null);
       // 若已解锁，走一遍解锁同步逻辑（手动触发：状态不变，effect 不会重跑）
       if (engine.unlock === 'unlocked') {
-        for (const t of restored.tracks) {
+        for (const t of doc.tracks) {
           if (t.sourceType === 'file' && t.blobKey) {
-            const blob = await idb.getBlob(t.blobKey);
-            if (blob) engine.setFileBlob(t.id, blob);
-            else patchTrack(t.id, { status: 'decode-error', errorMessage: '本地音频 Blob 缺失' });
+            try {
+              const blob = await idb.getBlob(t.blobKey);
+              if (blob) engine.setFileBlob(t.id, blob);
+              else patchTrack(t.id, { status: 'decode-error', errorMessage: '本地音频 Blob 缺失' });
+            } catch {
+              patchTrack(t.id, { status: 'decode-error', errorMessage: '读取本地音频失败' });
+            }
           }
           try {
             await engine.ensureTrack(t);
@@ -633,6 +833,7 @@ export function useWorkbench(): WorkbenchApi {
               errorMessage: undefined,
             });
           } catch (err) {
+            // 单条失败（未解码/解码失败）只标记该轨，绝不阻断其他轨
             if (err instanceof DecodeError) {
               patchTrack(t.id, { status: 'decode-error', errorMessage: err.message });
             }
@@ -657,7 +858,9 @@ export function useWorkbench(): WorkbenchApi {
 
   const newProject = useCallback(async () => {
     for (const t of docRef.current.tracks) engine.removeTrack(t.id);
+    engine.clearAllOverrides();
     setPlayingIds(new Set());
+    setOverrideMap(new Map());
     setDoc(emptyDoc());
     setLoadedProjectId(null);
     setLoadedProjectName(null);
@@ -665,6 +868,169 @@ export function useWorkbench(): WorkbenchApi {
   }, []);
 
   const dismissGlobalError = useCallback(() => setGlobalError(null), []);
+
+  // ---------- 每轨自动化 ----------
+
+  const lane = useCallback((trackId: string) => laneFor(docRef.current, trackId), []);
+
+  /** 纯函数式变更：在当前 lane 上执行 mutation，原子地写回 doc；冲突返回错误且原轨不动 */
+  function mutateLane(
+    trackId: string,
+    fn: (l: AutomationLane) => { lane: AutomationLane },
+  ): { ok: boolean; error?: string } {
+    let result: { ok: boolean; error?: string } = { ok: true };
+    setDoc((d) => {
+      const current = d.automation[trackId] ?? emptyLane(trackId);
+      try {
+        const { lane: next } = fn(current);
+        const automation = { ...d.automation, [trackId]: next };
+        return { ...d, automation };
+      } catch (err) {
+        result = {
+          ok: false,
+          error: err instanceof AutomationError ? err.message : String(err),
+        };
+        return d; // 拒绝时原轨原样保留
+      }
+    });
+    return result;
+  }
+
+  const commitFrame = useCallback((trackId: string, frame: AutomationFrameInput) => {
+    return mutateLane(trackId, (l) => commitKeyframe(l, frame));
+  }, []);
+
+  const deleteFrame = useCallback((trackId: string, keyframeId: string) => {
+    return mutateLane(trackId, (l) => laneDeleteKeyframe(l, keyframeId));
+  }, []);
+
+  const moveFrame = useCallback((trackId: string, keyframeId: string, time: number) => {
+    return mutateLane(trackId, (l) => laneMoveKeyframe(l, keyframeId, time));
+  }, []);
+
+  const updateFrameValue = useCallback(
+    (
+      trackId: string,
+      keyframeId: string,
+      value: { position?: Vec3; orientation?: Orientation; gain?: number },
+    ) => {
+      return mutateLane(trackId, (l) => laneUpdateKeyframeValue(l, keyframeId, value));
+    },
+    [],
+  );
+
+  const setLaneEnabled = useCallback((trackId: string, enabled: boolean) => {
+    setDoc((d) => {
+      const current = d.automation[trackId] ?? emptyLane(trackId);
+      const next = laneSetEnabled(current, enabled);
+      if (next === current) return d;
+      return { ...d, automation: { ...d.automation, [trackId]: next } };
+    });
+  }, []);
+
+  const clearFrames = useCallback((trackId: string) => {
+    return mutateLane(trackId, (l) => laneClearKeyframes(l));
+  }, []);
+
+  const undoAutomation = useCallback((trackId: string) => {
+    return mutateLane(trackId, (l) => laneUndoLast(l));
+  }, []);
+
+  const plannedAt = useCallback((track: Track, time: number) => {
+    const l = laneFor(docRef.current, track.id);
+    const s = sampleLane(l, time, track.loop ? track.duration : undefined);
+    return {
+      position: s.position ?? track.position,
+      orientation: s.orientation ?? track.orientation,
+      gain: s.gain ?? track.gain,
+    };
+  }, []);
+
+  // ---------- 播放中人工覆盖 ----------
+
+  const armOverride = useCallback(
+    (trackId: string, param: AutomationParam, value: Vec3 | Orientation | number) => {
+      if (!engine.isPlaying(trackId)) return;
+      engine.beginOverride(trackId, param, value);
+      addOverrideParam(trackId, param);
+    },
+    [],
+  );
+
+  const updateOverrideValue = useCallback(
+    (trackId: string, param: AutomationParam, value: Vec3 | Orientation | number) => {
+      engine.updateOverride(trackId, param, value);
+    },
+    [],
+  );
+
+  /** 取消覆盖：参数立即回到计划轨迹（引擎取消调度+回弹，doc 也恢复为计划值） */
+  const cancelOverride = useCallback((trackId: string, param: AutomationParam) => {
+    // 若覆盖已被提交等流程清掉，引擎返回 null：仅同步 UI 状态即可
+    const planned = engine.cancelOverride(trackId, param) as
+      | Vec3
+      | Orientation
+      | number
+      | null;
+    removeOverrideParamState(trackId, param);
+    if (planned === null) return;
+    if (param === 'position') {
+      const p = planned as Vec3;
+      setDoc((d) => ({
+        ...d,
+        tracks: d.tracks.map((t) => (t.id === trackId ? { ...t, position: { ...p } } : t)),
+      }));
+    } else if (param === 'orientation') {
+      const o = planned as Orientation;
+      setDoc((d) => ({
+        ...d,
+        tracks: d.tracks.map((t) => (t.id === trackId ? { ...t, orientation: { ...o } } : t)),
+      }));
+    } else {
+      const g = planned as number;
+      setDoc((d) => ({
+        ...d,
+        tracks: d.tracks.map((t) => (t.id === trackId ? { ...t, gain: g } : t)),
+      }));
+    }
+  }, []);
+
+  const cancelAllOverrides = useCallback((trackId: string) => {
+    for (const p of engine.getOverrides(trackId)) {
+      cancelOverride(trackId, p);
+    }
+  }, [cancelOverride]);
+
+  /**
+   * 提交覆盖：在当前播放媒体时间把临时值显式写成新关键帧（可审计新版本）。
+   * 同刻冲突会被 commitKeyframe 拒绝，原自动化轨保留，覆盖继续保留给用户重新选择。
+   */
+  const commitOverride = useCallback(
+    (trackId: string, param: AutomationParam): { ok: boolean; error?: string } => {
+      const t = docRef.current.tracks.find((x) => x.id === trackId);
+      if (!t) return { ok: false, error: '声轨不存在' };
+      const media = engine.getMediaTime(trackId);
+      const frame: AutomationFrameInput =
+        param === 'position'
+          ? { time: media, param, position: { ...t.position } }
+          : param === 'orientation'
+            ? { time: media, param, orientation: { ...t.orientation } }
+            : { time: media, param, gain: t.gain };
+      const res = mutateLane(trackId, (l) => commitKeyframe(l, frame));
+      if (res.ok) {
+        engine.clearOverride(trackId, param);
+        removeOverrideParamState(trackId, param);
+      }
+      return res;
+    },
+    [],
+  );
+
+  const overridesApi = useMemo(() => {
+    const m = new Map<string, OverrideState>();
+    for (const [id, st] of overrideMap) m.set(id, st);
+    return m;
+  }, [overrideMap]);
 
   const api = useMemo<WorkbenchApi>(
     () => ({
@@ -679,6 +1045,8 @@ export function useWorkbench(): WorkbenchApi {
       loadedProjectName,
       saveState,
       globalError,
+      live,
+      overrides: overridesApi,
       selectTrack,
       unlockAudio,
       addSample,
@@ -686,6 +1054,7 @@ export function useWorkbench(): WorkbenchApi {
       removeTrack,
       updateTrack,
       moveTrack,
+      setOrientation,
       setListener,
       setSpatial,
       setBusGain,
@@ -703,6 +1072,20 @@ export function useWorkbench(): WorkbenchApi {
       deleteProject,
       newProject,
       dismissGlobalError,
+      lane,
+      commitFrame,
+      deleteFrame,
+      moveFrame,
+      updateFrameValue,
+      setLaneEnabled,
+      clearFrames,
+      undoAutomation,
+      plannedAt,
+      armOverride,
+      updateOverrideValue,
+      cancelOverride,
+      commitOverride,
+      cancelAllOverrides,
     }),
     [
       doc,
@@ -716,6 +1099,8 @@ export function useWorkbench(): WorkbenchApi {
       loadedProjectName,
       saveState,
       globalError,
+      live,
+      overridesApi,
       selectTrack,
       unlockAudio,
       addSample,
@@ -723,6 +1108,7 @@ export function useWorkbench(): WorkbenchApi {
       removeTrack,
       updateTrack,
       moveTrack,
+      setOrientation,
       setListener,
       setSpatial,
       setBusGain,
@@ -740,6 +1126,20 @@ export function useWorkbench(): WorkbenchApi {
       deleteProject,
       newProject,
       dismissGlobalError,
+      lane,
+      commitFrame,
+      deleteFrame,
+      moveFrame,
+      updateFrameValue,
+      setLaneEnabled,
+      clearFrames,
+      undoAutomation,
+      plannedAt,
+      armOverride,
+      updateOverrideValue,
+      cancelOverride,
+      commitOverride,
+      cancelAllOverrides,
     ],
   );
 

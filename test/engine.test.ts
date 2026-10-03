@@ -16,6 +16,8 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 class FakeAudioParam {
   value: number;
   events: { time: number; value: number; tc: number }[] = [];
+  ramps: { time: number; value: number }[] = [];
+  cancels: number[] = [];
   constructor(v: number) {
     this.value = v;
   }
@@ -23,8 +25,20 @@ class FakeAudioParam {
     this.value = v;
     this.events.push({ time, value: v, tc });
   }
-  setValueAtTime(v: number) {
+  setValueAtTime(v: number, time: number) {
     this.value = v;
+    this.events.push({ time, value: v, tc: 0 });
+  }
+  linearRampToValueAtTime(v: number, time: number) {
+    this.ramps.push({ time, value: v });
+  }
+  cancelScheduledValues(time: number) {
+    this.cancels.push(time);
+    this.events = this.events.filter((e) => e.time < time);
+    this.ramps = this.ramps.filter((e) => e.time < time);
+  }
+  cancelAndHoldAtTime(time: number) {
+    this.cancelScheduledValues(time);
   }
 }
 
@@ -60,13 +74,18 @@ class FakePanner extends FakeNode {
   positionY = new FakeAudioParam(0);
   positionZ = new FakeAudioParam(0);
   positionTimeConstant = 0;
-  orientationX = new FakeAudioParam(1);
+  orientationX = new FakeAudioParam(0);
+  orientationY = new FakeAudioParam(0);
+  orientationZ = new FakeAudioParam(-1);
   constructor(_ctx: unknown, opts: Record<string, unknown> = {}) {
     super();
     Object.assign(this, opts);
     if (opts.positionX !== undefined) this.positionX = new FakeAudioParam(opts.positionX as number);
     if (opts.positionY !== undefined) this.positionY = new FakeAudioParam(opts.positionY as number);
     if (opts.positionZ !== undefined) this.positionZ = new FakeAudioParam(opts.positionZ as number);
+    if (opts.orientationX !== undefined) this.orientationX = new FakeAudioParam(opts.orientationX as number);
+    if (opts.orientationY !== undefined) this.orientationY = new FakeAudioParam(opts.orientationY as number);
+    if (opts.orientationZ !== undefined) this.orientationZ = new FakeAudioParam(opts.orientationZ as number);
   }
 }
 type DistanceModelStr = 'linear' | 'inverse' | 'exponential';
@@ -199,6 +218,7 @@ function baseTrack(over: Partial<import('../src/types.ts').Track> = {}) {
     channel: 0,
     color: '#fff',
     position: { x: 2, y: 0, z: 0 },
+    orientation: { yaw: 0, pitch: 0 },
     status: 'pending' as const,
     ...over,
   };
@@ -360,5 +380,139 @@ describe('AudioEngine 图行为（模拟环境）', () => {
     const buf = createSampleBuffer(engine.ctx as unknown as BaseAudioContext, 'pulse');
     assert.equal(buf.numberOfChannels, 1);
     assert.ok(Math.abs(buf.duration - 1.6) < 1e-6);
+  });
+
+  // ---------- 空间自动化调度 ----------
+
+  function automationLane(trackId: string) {
+    return {
+      trackId,
+      version: 1 as const,
+      enabled: true,
+      revisionSeq: 3,
+      revisions: [],
+      keyframes: [
+        { id: 'kf1', time: 0, param: 'position' as const, position: { x: -3, y: 0, z: 0 }, createdAt: 0 },
+        { id: 'kf2', time: 0.5, param: 'position' as const, position: { x: 3, y: 0, z: 0 }, createdAt: 0 },
+        { id: 'kf3', time: 0.2, param: 'gain' as const, gain: 0.2, createdAt: 0 },
+        { id: 'kf4', time: 0.55, param: 'gain' as const, gain: 1, createdAt: 0 },
+      ],
+    };
+  }
+
+  it('播放自动化：位置/增益按 AudioContext 时钟排入 AudioParam，source 不重启', async () => {
+    await engine.resume();
+    const t = { ...baseTrack(), loop: false, position: { x: -3, y: 0, z: 0 } };
+    engine.setAutomationLanes({ t1: automationLane('t1') });
+    await engine.playTrack(t);
+    const v = (engine as unknown as {
+      voices: Map<string, { source: FakeBufferSource; panner: FakePanner; trackGain: FakeGain }>;
+    }).voices.get('t1')!;
+    const starts = v.source.started.length;
+
+    // 立即调度：窗口起点 setValue（x=-3，gain 起点在 0.25 之前持住 0.2）
+    assert.ok(v.panner.positionX.events.some((e) => Math.abs(e.value - -3) < 1e-9));
+    // 0.5s 的位置锚点在窗口内（0..0.35 前瞻起点为 0，0.5 不在首个窗口，模拟时钟推进）
+    const ctx = engine.ctx as unknown as FakeAudioContext;
+    ctx.currentTime = 0.2;
+    engine.runAutomationTickForTest();
+    // 每 tick 先 cancel 再重排：cancel 次数增加，但 start/stop 次数不变
+    assert.equal(v.source.started.length, starts);
+    assert.equal(v.source.stopped, 0);
+    ctx.currentTime = 0.4;
+    engine.runAutomationTickForTest();
+    // 现在 0.5s 的 ramp 事件进入窗口（绝对时间 = startedAt + (0.5 - offset)=0.5）
+    const xRampTo3 = v.panner.positionX.ramps.some(
+      (r) => Math.abs(r.time - 0.5) < 1e-9 && Math.abs(r.value - 3) < 1e-9,
+    );
+    assert.ok(xRampTo3, 'x 应在 0.5s 线性 ramp 到 +3');
+    const gainRampToOne = v.trackGain.gain.ramps.some(
+      (r) => Math.abs(r.time - 0.55) < 1e-9 && Math.abs(r.value - 1) < 1e-9,
+    );
+    assert.ok(gainRampToOne, 'gain 应在 0.55s ramp 到 1');
+    // source 始终只有 1 次 start、0 次 stop
+    assert.equal(v.source.started.length, 1);
+    assert.equal(v.source.stopped, 0);
+  });
+
+  it('暂停→seek→再播：旧调度随节点销毁，新节点重新调度，不叠加/不重复发声', async () => {
+    await engine.resume();
+    const t = { ...baseTrack(), loop: false };
+    engine.setAutomationLanes({ t1: automationLane('t1') });
+    await engine.playTrack(t);
+    const ctx = engine.ctx as unknown as FakeAudioContext;
+    ctx.currentTime = 0.1;
+    engine.runAutomationTickForTest();
+    engine.pauseTrack(t); // 重建未播放节点（旧 source stop 一次）
+    await engine.seekTrack(t, 0.3, false);
+    const voices1 = (engine as unknown as {
+      voices: Map<string, { source: FakeBufferSource; panner: FakePanner }>;
+    }).voices;
+    const before = voices1.get('t1')!.source;
+    assert.equal(before.started.length, 0, 'seek 后未播放的 source 不应 start');
+    await engine.playTrack(t);
+    const after = voices1.get('t1')!.source;
+    assert.equal(after.started.length, 1);
+    // 新 source 的事件数组是全新 FakeAudioParam：没有历史 0.1s 调度残留
+    const px = voices1.get('t1')!.panner.positionX;
+    const times = px.events.map((e) => e.time);
+    assert.ok(times.every((tm) => tm >= 0, 1e-9), '不应出现 seek 前媒体时间的旧事件');
+  });
+
+  it('循环播放：跨回绕边界的位置包络周期重复，且不重启 source', async () => {
+    await engine.resume();
+    const ctx = engine.ctx as unknown as FakeAudioContext;
+    const t = { ...baseTrack(), loop: true, position: { x: 0, y: 0, z: 0 } };
+    const lane = {
+      trackId: 't1',
+      version: 1 as const,
+      enabled: true,
+      revisionSeq: 1,
+      revisions: [],
+      keyframes: [
+        { id: 'a', time: 0, param: 'position' as const, position: { x: 0, y: 0, z: 0 }, createdAt: 0 },
+        { id: 'b', time: 0.5, param: 'position' as const, position: { x: 2, y: 0, z: 0 }, createdAt: 0 },
+      ],
+    };
+    engine.setAutomationLanes({ t1: lane });
+    await engine.playTrack(t);
+    const v = (engine as unknown as {
+      voices: Map<string, { source: FakeBufferSource; panner: FakePanner; duration: number }>;
+    }).voices.get('t1')!;
+    // tone 缓冲时长 3 秒；推进到接近回绕点 2.9
+    ctx.currentTime = 2.9;
+    engine.runAutomationTickForTest();
+    // 窗口 [2.9, 3.25] 内出现回绕点媒体 3.0（=0）
+    let rampTimes = v.panner.positionX.ramps.map((r) => r.time);
+    assert.ok(rampTimes.some((tm) => Math.abs(tm - 3.0) < 1e-6), '回绕点 3.0s 应重排 x=0');
+    // 推进时钟到 3.2：窗口 [3.2,3.55] 覆盖下一周期 3.5 的锚点；cancel+重排不重启 source
+    ctx.currentTime = 3.2;
+    engine.runAutomationTickForTest();
+    rampTimes = v.panner.positionX.ramps.map((r) => r.time);
+    assert.ok(rampTimes.some((tm) => Math.abs(tm - 3.5) < 1e-6), '下一周期 3.5s 应重排 x=2');
+    assert.equal(v.source.started.length, 1);
+    assert.equal(v.source.stopped, 0);
+  });
+
+  it('播放中人工覆盖接管位置参数；取消后回到计划值；提交清除覆盖', async () => {
+    await engine.resume();
+    const ctx = engine.ctx as unknown as FakeAudioContext;
+    const t = { ...baseTrack(), loop: false, position: { x: -3, y: 0, z: 0 } };
+    engine.setAutomationLanes({ t1: automationLane('t1') });
+    await engine.playTrack(t);
+    ctx.currentTime = 0.4;
+    // 人工拖到 x=10
+    engine.beginOverride('t1', 'position', { x: 10, y: 1, z: 2 });
+    const v = (engine as unknown as {
+      voices: Map<string, { panner: FakePanner; source: FakeBufferSource }>;
+    }).voices.get('t1')!;
+    assert.equal(engine.hasOverride('t1', 'position'), true);
+    engine.runAutomationTickForTest();
+    // 覆盖期间自动化不再写 x ramp（已 cancel 未来事件且 setTarget 到 10）
+    assert.ok(Math.abs(v.panner.positionX.value - 10) < 1e-9);
+    // 取消：回到 0.4s 的计划位置。位置帧 0(-3)→0.5(+3)，0.4 处 = -3 + 0.4/0.5*6 = 1.8
+    const planned = engine.cancelOverride('t1', 'position') as { x: number };
+    assert.ok(Math.abs(planned.x - 1.8) < 1e-6, `计划x应≈1.8，实际 ${planned.x}`);
+    assert.equal(engine.hasOverride('t1', 'position'), false);
   });
 });
